@@ -177,9 +177,10 @@ def main():
 
     console.print(Panel.fit(
         "[bold cyan]Slope Around Medium — Astro-Bot[/bold cyan]\n"
-        "Cosmic Momentum Trading System\n"
+        "Cosmic Momentum · Hyperliquid Perpetuals\n"
         f"Asset: [yellow]{config.ACTIVE_ASSET}[/yellow]  |  "
-        f"Interval: [yellow]{config.CHECK_INTERVAL_MINUTES}min[/yellow]  |  "
+        f"Cadence: [yellow]{config.CHECK_INTERVAL_MINUTES}min[/yellow]  |  "
+        f"EMA: [yellow]{config.EMA_FILTER}({config.EMA_PERIOD})[/yellow]  |  "
         f"Mode: [yellow]{'PAPER' if config.PAPER_TRADING else 'LIVE'}[/yellow]",
         border_style="cyan",
     ))

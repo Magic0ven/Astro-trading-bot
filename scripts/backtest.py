@@ -31,7 +31,14 @@ logger.add(sys.stderr, level="WARNING")
 
 
 def fetch_historical_prices(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """Fetch hourly OHLCV from exchange for the backtest period."""
+    """
+    Fetch hourly OHLCV from Binance public API for the backtest period.
+
+    Note: this uses Binance as a historical DATA SOURCE only — no API key needed.
+    The live trading engine is Hyperliquid-only (exchange/market_data.py).
+    Binance is used here because Hyperliquid launched in late 2023 and lacks
+    the 2022–2023 data required for multi-year backtests.
+    """
     import ccxt
     exchange = ccxt.binance({"enableRateLimit": True})
     since_ms = int(start.timestamp() * 1000)

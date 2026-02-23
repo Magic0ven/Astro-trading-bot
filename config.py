@@ -182,9 +182,10 @@ ATR_PERIOD            = 14
 #
 LEVERAGE = int(os.getenv("LEVERAGE", "3"))          # 1 = no leverage (spot-equivalent)
 
-# ── Exchange ──────────────────────────────────────────────────────────────────
-EXCHANGE_NAME = os.getenv("EXCHANGE", "binance")
-MARKET_TYPE = os.getenv("MARKET_TYPE", "future")
+# ── Exchange — Hyperliquid only ───────────────────────────────────────────────
+# This bot is built exclusively for Hyperliquid (DEX perpetuals).
+# Authentication: EVM wallet address + private key (set in .env).
+# Use a dedicated agent sub-wallet — never your main wallet.
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 ACTIVE_ASSET = os.getenv("ACTIVE_ASSET", "BTC")
 
