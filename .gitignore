@@ -1,0 +1,52 @@
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+*.pem
+*.key
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Logs & runtime state ──────────────────────────────────────────────────────
+logs/
+# Keep the logs directory itself tracked but ignore all files inside it.
+# Re-create with: mkdir -p logs
+!logs/.gitkeep
+
+# ── Swiss Ephemeris data ──────────────────────────────────────────────────────
+# Large binary ephemeris files — download separately with scripts/download_ephe.py
+ephe/
+!ephe/.gitkeep
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Pytest / coverage ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/

@@ -1,0 +1,79 @@
+{
+  "_comment": "Natal positions are in ecliptic longitude degrees (0-360). Western = Tropical, Vedic = Sidereal (Lahiri). Positions computed at genesis datetime via pyswisseph. Run scripts/calculate_natal.py to regenerate.",
+  "BTC": {
+    "name": "Bitcoin",
+    "symbol": "BTC/USDC:USDC",
+    "_symbol_note": "Hyperliquid perp format. Use BTC/USDT for Binance/Bybit.",
+    "spot_symbol": "BTC/USDT",
+    "_spot_symbol_note": "Binance spot symbol used for historical price fetching in backtests.",
+    "genesis_datetime": "2009-01-03T18:15:05Z",
+    "genesis_location": {
+      "lat": 0.0,
+      "lon": 0.0,
+      "note": "Satoshi's location unknown \u2014 use 0,0 or London 51.5,0.0"
+    },
+    "life_path_number": 6,
+    "ticker_vibration": 2,
+    "natal_western": {
+      "Sun": 283.5142,
+      "Moon": 4.5532,
+      "Mercury": 302.7943,
+      "Venus": 330.2555,
+      "Mars": 275.6008,
+      "Jupiter": 299.5608,
+      "Saturn": 171.7586,
+      "Uranus": 349.3182,
+      "Neptune": 322.517,
+      "Pluto": 271.3559
+    },
+    "natal_vedic": {
+      "Sun": 259.5276,
+      "Moon": 340.5666,
+      "Mercury": 278.8077,
+      "Venus": 306.2689,
+      "Mars": 251.6142,
+      "Jupiter": 275.5742,
+      "Saturn": 147.772,
+      "Uranus": 325.3316,
+      "Neptune": 298.5304,
+      "Pluto": 247.3692,
+      "Rahu": 286.8299,
+      "Ketu": 106.8299
+    },
+    "dasha_lord_at_genesis": "Venus",
+    "dasha_weights": {
+      "Venus": 2.0,
+      "Sun": 1.2,
+      "Moon": 1.8,
+      "Mars": 1.3,
+      "Rahu": 1.5,
+      "Jupiter": 1.6,
+      "Saturn": 1.4,
+      "Mercury": 1.3,
+      "Ketu": 1.1
+    }
+  },
+  "ETH": {
+    "name": "Ethereum",
+    "symbol": "ETH/USDT",
+    "genesis_datetime": "2015-07-30T15:26:28Z",
+    "genesis_location": {
+      "lat": 0.0,
+      "lon": 0.0
+    },
+    "life_path_number": 2,
+    "ticker_vibration": 5,
+    "natal_western": null,
+    "natal_vedic": null,
+    "_note": "Run scripts/calculate_natal.py --asset ETH to populate natal positions"
+  },
+  "SOL": {
+    "name": "Solana",
+    "symbol": "SOL/USDT",
+    "genesis_datetime": "2020-03-16T00:00:00Z",
+    "life_path_number": 5,
+    "ticker_vibration": 1,
+    "natal_western": null,
+    "natal_vedic": null
+  }
+}

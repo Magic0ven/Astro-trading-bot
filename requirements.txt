@@ -1,0 +1,19 @@
+# Astronomical Calculations
+pyswisseph>=2.10.3.2
+astropy>=6.0.0
+ephem>=4.1.5
+
+# Market Data & Trading
+ccxt>=4.3.0
+pandas>=2.2.0
+numpy>=1.26.0
+
+# Scheduling & Infrastructure
+apscheduler>=3.10.4
+python-dotenv>=1.0.0
+loguru>=0.7.2
+rich>=13.7.0
+
+# Dashboard (optional)
+streamlit>=1.32.0
+plotly>=5.20.0
