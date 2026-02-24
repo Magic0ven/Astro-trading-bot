@@ -25,6 +25,26 @@ from loguru import logger
 import config
 from exchange.market_data import get_exchange
 
+# ── Postgres adapter (used when DATABASE_URL is set) ──────────────────────────
+
+_USE_PG     = bool(os.getenv("DATABASE_URL"))
+_USER_ID    = os.getenv("BOT_USER_ID", "default")   # unique per Railway service
+
+if _USE_PG:
+    from db.postgres import (
+        init_schema as _pg_init,
+        pg_log_signal,
+        pg_log_close,
+        pg_load_positions,
+        pg_save_positions,
+        pg_load_equity,
+        pg_save_equity,
+    )
+    _pg_init()
+    logger.info(f"PostgreSQL storage enabled (user_id='{_USER_ID}').")
+else:
+    logger.info("Using SQLite/JSON file storage (DATABASE_URL not set).")
+
 
 # ── Persistent state file paths ───────────────────────────────────────────────
 
@@ -75,6 +95,9 @@ _init_db()
 
 
 def log_signal_to_db(signal: dict, paper: bool = True, notes: str = ""):
+    if _USE_PG:
+        pg_log_signal(signal, paper, notes, user_id=_USER_ID)
+        return
     conn = sqlite3.connect(config.DB_PATH)
     conn.execute("""
         INSERT INTO signals (
@@ -169,6 +192,8 @@ def set_leverage_on_exchange(symbol: str):
 # ── Gap 2: Open position tracker (48h timeout) ────────────────────────────────
 
 def _load_open_positions() -> list:
+    if _USE_PG:
+        return pg_load_positions(user_id=_USER_ID)
     if OPEN_POSITIONS_FILE.exists():
         with open(OPEN_POSITIONS_FILE) as f:
             return json.load(f)
@@ -176,6 +201,9 @@ def _load_open_positions() -> list:
 
 
 def _save_open_positions(positions: list):
+    if _USE_PG:
+        pg_save_positions(positions, user_id=_USER_ID)
+        return
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(OPEN_POSITIONS_FILE, "w") as f:
         json.dump(positions, f, indent=2)
@@ -293,6 +321,8 @@ def check_and_close_stale_positions():
 # ── Gap 3: Drawdown halt tracker ──────────────────────────────────────────────
 
 def _load_equity_state() -> dict:
+    if _USE_PG:
+        return pg_load_equity(user_id=_USER_ID)
     if EQUITY_STATE_FILE.exists():
         with open(EQUITY_STATE_FILE) as f:
             return json.load(f)
@@ -307,6 +337,9 @@ def _load_equity_state() -> dict:
 
 
 def _save_equity_state(state: dict):
+    if _USE_PG:
+        pg_save_equity(state, user_id=_USER_ID)
+        return
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(EQUITY_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
@@ -400,30 +433,49 @@ def check_paper_positions(current_price: float) -> list[dict]:
                 state["paper_losses"] = state.get("paper_losses", 0) + 1
 
             # Persist close record to DB
-            conn = sqlite3.connect(config.DB_PATH)
-            conn.execute("""
-                INSERT INTO signals (
-                    timestamp, asset, symbol, action,
-                    entry_price, stop_loss, target, position_usdt,
-                    paper, notes, close_price, pnl, result
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                datetime.now(timezone.utc).isoformat(),
-                (pos.get("symbol") or "").split("/")[0],
-                pos.get("symbol"),
-                f"CLOSE_{result}",
-                entry,
-                stop_loss,
-                target,
-                pos.get("notional"),
-                1,
-                f"Paper close — {result} hit at {close_px:.2f}",
-                close_px,
-                round(pnl, 4),
-                result,
-            ))
-            conn.commit()
-            conn.close()
+            _ts  = datetime.now(timezone.utc).isoformat()
+            _sym = pos.get("symbol", "")
+            _notes = f"Paper close — {result} hit at {close_px:.2f}"
+            if _USE_PG:
+                pg_log_close(
+                    symbol=_sym,
+                    action=f"CLOSE_{result}",
+                    entry_price=entry,
+                    stop_loss=stop_loss,
+                    target=target,
+                    notional=pos.get("notional", 0.0),
+                    close_price=close_px,
+                    pnl=round(pnl, 4),
+                    result=result,
+                    notes=_notes,
+                    ts=_ts,
+                    user_id=_USER_ID,
+                )
+            else:
+                conn = sqlite3.connect(config.DB_PATH)
+                conn.execute("""
+                    INSERT INTO signals (
+                        timestamp, asset, symbol, action,
+                        entry_price, stop_loss, target, position_usdt,
+                        paper, notes, close_price, pnl, result
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    _ts,
+                    _sym.split("/")[0],
+                    _sym,
+                    f"CLOSE_{result}",
+                    entry,
+                    stop_loss,
+                    target,
+                    pos.get("notional"),
+                    1,
+                    _notes,
+                    close_px,
+                    round(pnl, 4),
+                    result,
+                ))
+                conn.commit()
+                conn.close()
 
             closed.append({**pos, "result": result, "close_price": close_px, "pnl": pnl})
             logger.info(

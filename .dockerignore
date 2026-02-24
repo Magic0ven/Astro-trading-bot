@@ -1,0 +1,35 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Logs & runtime state (mounted as Railway volume at runtime)
+logs/
+*.db
+
+# Backtest outputs
+scripts/__pycache__/
+scripts/*.csv
+scripts/*.png
+
+# Dev tools
+.env
+.env.local
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# IDE
+.cursor/
+.vscode/
+*.swp
