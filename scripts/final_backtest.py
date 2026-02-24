@@ -147,6 +147,7 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
     ot            = None
     total_bars    = 0
     bars_in_trade = 0
+    equity_curve  = []   # (timestamp, equity) sampled every bar
 
     for i, row in rows.iterrows():
         action = row["action"]
@@ -233,6 +234,8 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
                 ot = None
             else:
                 ot["age"] += 1
+
+        equity_curve.append({"ts": ts, "equity": equity})
 
         # ── Signal filters ─────────────────────────────────────────────────
         if action not in ("STRONG_BUY", "STRONG_SELL"):
@@ -324,6 +327,10 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
     idle_days   = total_bars * cadence / 24
     idle_yield  = starting_capital * idle_pct * 0.045 * idle_days / 365
 
+    # Build price / EMA series for plotting
+    price_series = rows[["timestamp", "price"]].copy()
+    price_series["ema"] = em.values
+
     return {
         "trades": len(trades), "wins": len(wins), "losses": len(losses),
         "wr": wr, "avg_win": avg_w, "avg_loss": avg_l, "exp": exp,
@@ -344,6 +351,9 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
         "return_on_risk": ror,
         "idle_yield_est": idle_yield,
         "cadence": cadence,
+        # chart data
+        "equity_curve": equity_curve,
+        "price_series": price_series,
     }
 
 

@@ -24,19 +24,27 @@ import config
 
 def _build_exchange() -> ccxt.hyperliquid:
     """
-    Build a ccxt Hyperliquid instance authenticated via EVM wallet.
+    Build a ccxt Hyperliquid instance.
 
-    Hyperliquid is a DEX — there are no traditional API keys.
-    Set HYPERLIQUID_WALLET_ADDRESS and HYPERLIQUID_PRIVATE_KEY in .env.
+    Paper trading (PAPER_TRADING=true):
+      No credentials required. Price and OHLCV are public endpoints.
+      Balance fetch will fail and automatically fall back to CAPITAL_USDT.
+      Leave HYPERLIQUID_WALLET_ADDRESS and HYPERLIQUID_PRIVATE_KEY blank.
 
-    For read-only operations (price, candles) the wallet address alone is
-    sufficient. The private key is only used when placing orders.
+    Live trading (PAPER_TRADING=false):
+      Set both HYPERLIQUID_WALLET_ADDRESS and HYPERLIQUID_PRIVATE_KEY in .env.
+      Use a dedicated agent sub-wallet — never your main wallet.
     """
-    return ccxt.hyperliquid({
-        "walletAddress": os.getenv("HYPERLIQUID_WALLET_ADDRESS", ""),
-        "privateKey":    os.getenv("HYPERLIQUID_PRIVATE_KEY", ""),
-        "enableRateLimit": True,
-    })
+    wallet  = os.getenv("HYPERLIQUID_WALLET_ADDRESS", "")
+    privkey = os.getenv("HYPERLIQUID_PRIVATE_KEY", "")
+
+    cfg: dict = {"enableRateLimit": True}
+    if wallet:
+        cfg["walletAddress"] = wallet
+    if privkey:
+        cfg["privateKey"] = privkey
+
+    return ccxt.hyperliquid(cfg)
 
 
 _exchange: ccxt.hyperliquid = None
@@ -136,16 +144,27 @@ def get_account_balance() -> float:
             or balance.get("info", {}).get("marginSummary", {}).get("accountValue")
         )
 
-        val = float(equity) if equity is not None else 0.0
+        if equity is None:
+            raise ValueError(f"Unexpected balance structure: {balance}")
+
+        val = float(equity)
         if val > 0:
             logger.info(f"Hyperliquid account equity: ${val:,.2f} USDC")
             return val
-        raise ValueError(f"Unexpected balance structure: {balance}")
+
+        # Wallet connected but has $0 — agent wallet not yet funded.
+        # Fall back to CAPITAL_USDT for paper trading sizing.
+        logger.warning(
+            f"Hyperliquid wallet balance is $0.00 — agent wallet not funded yet. "
+            f"Using CAPITAL_USDT=${config.CAPITAL_USDT:,.2f} for position sizing. "
+            f"This is fine for paper trading."
+        )
+        return config.CAPITAL_USDT
 
     except Exception as e:
         logger.warning(
-            f"Could not fetch Hyperliquid balance ({e}) — "
-            f"falling back to CAPITAL_USDT=${config.CAPITAL_USDT:,.2f}"
+            f"Hyperliquid balance fetch failed ({e}) — "
+            f"using CAPITAL_USDT=${config.CAPITAL_USDT:,.2f}"
         )
         return config.CAPITAL_USDT
 

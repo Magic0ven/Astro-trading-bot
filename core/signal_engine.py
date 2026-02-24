@@ -189,14 +189,40 @@ def generate_signal(
 
     # 6. Generate individual signals (only if history is ready)
     if not score_history.is_ready():
-        logger.info("Collecting history... not enough data for signal yet.")
+        bars = score_history.bars_collected()
+        needed = 2
+        logger.info(
+            f"Collecting history — bar {bars}/{needed}. "
+            f"Signal will fire on next cycle."
+        )
         return {
-            "status": "COLLECTING_DATA",
-            "western_score": western_score_adj,
-            "vedic_score": vedic_score_adj,
-            "sky": sky,
-            "numerology": num_report,
-            "history": hist,
+            "status":           "COLLECTING_DATA",
+            "final_action":     "COLLECTING_DATA",
+            "asset":            asset_dna.get("name", ""),
+            "symbol":           asset_dna.get("symbol", ""),
+            "current_price":    current_price,
+            "ema_value":        round(current_ema, 2) if current_ema else None,
+            "effective_capital": round(capital if capital > 0 else config.CAPITAL_USDT, 2),
+            "western_score":    round(western_score_adj, 4),
+            "vedic_score":      round(vedic_score_adj, 4),
+            "western_medium":   0.0,
+            "vedic_medium":     0.0,
+            "western_slope":    0.0,
+            "vedic_slope":      0.0,
+            "western_signal":   "",
+            "vedic_signal":     "",
+            "nakshatra":        sky.get("nakshatra", ""),
+            "nakshatra_multiplier": sky.get("nakshatra_multiplier", 1.0),
+            "moon_fast":        sky.get("moon_fast", False),
+            "retrograde_western": sky.get("retrograde_planets_western", []),
+            "retrograde_vedic": sky.get("retrograde_planets_vedic", []),
+            "stop_loss":        0.0,
+            "target":           0.0,
+            "position_size_usdt": 0.0,
+            "numerology":       num_report,
+            "history":          hist,
+            "bars_collected":   bars,
+            "bars_needed":      needed,
         }
 
     w_medium = hist["western"]["medium"]

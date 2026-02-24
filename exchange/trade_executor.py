@@ -39,25 +39,34 @@ def _init_db():
     conn = sqlite3.connect(config.DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp   TEXT,
-            asset       TEXT,
-            symbol      TEXT,
-            action      TEXT,
-            entry_price REAL,
-            stop_loss   REAL,
-            target      REAL,
-            position_usdt REAL,
-            western_score REAL,
-            vedic_score   REAL,
-            western_slope REAL,
-            vedic_slope   REAL,
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT,
+            asset           TEXT,
+            symbol          TEXT,
+            action          TEXT,
+            entry_price     REAL,
+            stop_loss       REAL,
+            target          REAL,
+            position_usdt   REAL,
+            western_score   REAL,
+            vedic_score     REAL,
+            western_slope   REAL,
+            vedic_slope     REAL,
             numerology_mult REAL,
-            nakshatra   TEXT,
-            paper       INTEGER,
-            notes       TEXT
+            nakshatra       TEXT,
+            paper           INTEGER,
+            notes           TEXT,
+            close_price     REAL,
+            pnl             REAL,
+            result          TEXT
         )
     """)
+    # Add columns to existing DBs that pre-date the pnl tracking feature
+    for col, coltype in [("close_price", "REAL"), ("pnl", "REAL"), ("result", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {coltype}")
+        except Exception:
+            pass  # column already exists
     conn.commit()
     conn.close()
 
@@ -287,13 +296,149 @@ def _load_equity_state() -> dict:
     if EQUITY_STATE_FILE.exists():
         with open(EQUITY_STATE_FILE) as f:
             return json.load(f)
-    return {"peak_equity": 0.0}
+    return {
+        "peak_equity":    0.0,
+        "paper_pnl":      0.0,
+        "paper_trades":   0,
+        "paper_wins":     0,
+        "paper_losses":   0,
+        "paper_timeouts": 0,
+    }
 
 
 def _save_equity_state(state: dict):
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(EQUITY_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def get_paper_summary() -> dict:
+    """Return the current paper trading P&L summary from equity_state.json."""
+    return _load_equity_state()
+
+
+# ── Paper position P&L monitor ────────────────────────────────────────────────
+
+TAKER_FEE = 0.0005  # 0.05% per side = 0.10% round-trip (Hyperliquid taker)
+
+
+def _calc_paper_pnl(pos: dict, close_price: float) -> float:
+    """
+    Calculate realised P&L for a closed paper position.
+
+    P&L = (price_change_per_coin × coins) − round-trip fees
+    Coins = notional / entry_price
+    """
+    entry    = pos.get("entry_price", 0.0)
+    notional = pos.get("notional", 0.0)
+    action   = pos.get("action", "")
+    if entry <= 0 or notional <= 0:
+        return 0.0
+
+    coins = notional / entry
+    if "BUY" in action:
+        raw_pnl = (close_price - entry) * coins
+    else:
+        raw_pnl = (entry - close_price) * coins
+
+    fees = notional * TAKER_FEE * 2  # entry + exit
+    return raw_pnl - fees
+
+
+def check_paper_positions(current_price: float) -> list[dict]:
+    """
+    Check all open paper positions against current_price.
+
+    For each position:
+      - LONG  (BUY):  TP hit if price ≥ target, SL hit if price ≤ stop_loss
+      - SHORT (SELL): TP hit if price ≤ target, SL hit if price ≥ stop_loss
+
+    Returns a list of closed-position dicts (may be empty) so bot_cycle can
+    display P&L to the console.
+    """
+    positions = _load_open_positions()
+    if not positions:
+        return []
+
+    closed   = []
+    still_open = []
+    state    = _load_equity_state()
+
+    for pos in positions:
+        if not pos.get("paper", True):
+            still_open.append(pos)
+            continue
+
+        action     = pos.get("action", "")
+        stop_loss  = pos.get("stop_loss",  0.0)
+        target     = pos.get("target",     0.0)
+        entry      = pos.get("entry_price", 0.0)
+
+        result     = None
+        close_px   = None
+
+        if "BUY" in action:
+            if current_price >= target:
+                result, close_px = "TP", target
+            elif current_price <= stop_loss:
+                result, close_px = "SL", stop_loss
+        else:  # SELL / SHORT
+            if current_price <= target:
+                result, close_px = "TP", target
+            elif current_price >= stop_loss:
+                result, close_px = "SL", stop_loss
+
+        if result:
+            pnl = _calc_paper_pnl(pos, close_px)
+
+            # Update running totals
+            state["paper_pnl"]    = state.get("paper_pnl", 0.0) + pnl
+            state["paper_trades"] = state.get("paper_trades", 0) + 1
+            if pnl > 0:
+                state["paper_wins"]   = state.get("paper_wins", 0) + 1
+            else:
+                state["paper_losses"] = state.get("paper_losses", 0) + 1
+
+            # Persist close record to DB
+            conn = sqlite3.connect(config.DB_PATH)
+            conn.execute("""
+                INSERT INTO signals (
+                    timestamp, asset, symbol, action,
+                    entry_price, stop_loss, target, position_usdt,
+                    paper, notes, close_price, pnl, result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                datetime.now(timezone.utc).isoformat(),
+                (pos.get("symbol") or "").split("/")[0],
+                pos.get("symbol"),
+                f"CLOSE_{result}",
+                entry,
+                stop_loss,
+                target,
+                pos.get("notional"),
+                1,
+                f"Paper close — {result} hit at {close_px:.2f}",
+                close_px,
+                round(pnl, 4),
+                result,
+            ))
+            conn.commit()
+            conn.close()
+
+            closed.append({**pos, "result": result, "close_price": close_px, "pnl": pnl})
+            logger.info(
+                f"[PAPER CLOSE] {result} hit — {action} {pos.get('symbol')} | "
+                f"Entry: {entry:.2f} → Close: {close_px:.2f} | "
+                f"P&L: {'+'if pnl>=0 else ''}{pnl:.4f} USDT"
+            )
+        else:
+            still_open.append(pos)
+
+    if closed:
+        _save_open_positions(still_open)
+        _save_equity_state(state)
+
+    return closed
 
 
 def update_peak_equity(current_equity: float):

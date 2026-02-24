@@ -11,6 +11,8 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pathlib import Path
+
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
 from loguru import logger
@@ -28,7 +30,9 @@ from exchange.market_data import get_price_atr_ema, get_account_balance
 from exchange.trade_executor import (
     dispatch_signal,
     check_and_close_stale_positions,
+    check_paper_positions,
     update_peak_equity,
+    get_paper_summary,
 )
 
 console = Console()
@@ -73,6 +77,10 @@ def display_signal(signal: dict):
     table.add_column("Value", style="bold")
 
     table.add_row("Action",     f"[{color}]{action}[/{color}]")
+    if action == "COLLECTING_DATA":
+        bars    = signal.get("bars_collected", 1)
+        needed  = signal.get("bars_needed", 2)
+        table.add_row("Progress", f"bar {bars}/{needed} — signal fires next cycle")
     table.add_row("Asset",      signal.get("asset", ""))
     table.add_row("Price",      f"${signal.get('current_price', 0):,.2f}")
     table.add_row("Stop Loss",  f"${signal.get('stop_loss', 0):,.2f}")
@@ -116,9 +124,68 @@ def display_signal(signal: dict):
     console.print(panel)
 
 
+# ── Paper P&L display ──────────────────────────────────────────────────────────
+
+def display_paper_pnl(closed_this_cycle: list):
+    """Print a paper trading P&L summary panel."""
+    summary = get_paper_summary()
+    total_pnl    = summary.get("paper_pnl", 0.0)
+    total_trades = summary.get("paper_trades", 0)
+    wins         = summary.get("paper_wins", 0)
+    losses       = summary.get("paper_losses", 0)
+    win_rate     = (wins / total_trades * 100) if total_trades > 0 else 0.0
+    pnl_color    = "green" if total_pnl >= 0 else "red"
+    sign         = "+" if total_pnl >= 0 else ""
+
+    tbl = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    tbl.add_column("k", style="dim")
+    tbl.add_column("v", style="bold")
+
+    tbl.add_row("Total P&L",  f"[{pnl_color}]{sign}{total_pnl:.4f} USDT[/{pnl_color}]")
+    tbl.add_row("Trades",     f"{total_trades}  ({wins}W / {losses}L)")
+    tbl.add_row("Win rate",   f"{win_rate:.1f}%")
+
+    # Show trades closed this cycle
+    if closed_this_cycle:
+        tbl.add_row("", "")
+        for t in closed_this_cycle:
+            p = t["pnl"]
+            color = "green" if p >= 0 else "red"
+            sign2 = "+" if p >= 0 else ""
+            tbl.add_row(
+                f"  {t['result']}",
+                f"[{color}]{sign2}{p:.4f} USDT[/{color}]  "
+                f"({t['action']} @ {t['entry_price']:.2f} → {t['close_price']:.2f})",
+            )
+
+    # Count currently open paper positions
+    from exchange.trade_executor import _load_open_positions
+    open_pos = [p for p in _load_open_positions() if p.get("paper", True)]
+    tbl.add_row("", "")
+    tbl.add_row("Open positions", str(len(open_pos)))
+    if open_pos:
+        for p in open_pos:
+            tbl.add_row(
+                f"  {p['action']}",
+                f"entry {p.get('entry_price', 0):.2f}  "
+                f"SL {p.get('stop_loss', 0):.2f}  "
+                f"TP {p.get('target', 0):.2f}",
+            )
+
+    console.print(Panel(
+        tbl,
+        title="[bold yellow]Paper Trading P&L[/bold yellow]",
+        border_style="yellow",
+        expand=False,
+    ))
+
+
 # ── Bot cycle ──────────────────────────────────────────────────────────────────
 
-score_history = ScoreHistory(window=config.SCORE_HISTORY_WINDOW)
+score_history = ScoreHistory(
+    window=config.SCORE_HISTORY_WINDOW,
+    persist_path=Path("logs/score_history.json"),
+)
 asset_dna: dict = {}
 
 
@@ -137,6 +204,11 @@ def bot_cycle():
     if price <= 0:
         logger.error("Failed to get price — skipping cycle.")
         return
+
+    # Paper P&L: check if any open paper positions hit SL or TP at current price
+    closed_this_cycle = []
+    if config.PAPER_TRADING:
+        closed_this_cycle = check_paper_positions(price)
 
     # Fetch live balance once; derive effective capital from it.
     # This avoids two separate API calls and keeps equity tracking consistent.
@@ -160,12 +232,16 @@ def bot_cycle():
         capital=capital,
     )
 
-    # Display
+    # Display signal
     display_signal(signal)
 
     # Execute / paper trade
     # current_equity=balance passes the full account balance for drawdown check
     dispatch_signal(signal, current_equity=balance)
+
+    # Display paper P&L panel (paper mode only)
+    if config.PAPER_TRADING:
+        display_paper_pnl(closed_this_cycle)
 
     logger.info("=== Cycle complete ===\n")
 
