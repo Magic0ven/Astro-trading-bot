@@ -88,6 +88,7 @@ def _full_signal_payload(signal: dict) -> str:
         "moon_fast":          signal.get("moon_fast"),
         "retrograde_western": signal.get("retrograde_western") or [],
         "retrograde_vedic":   signal.get("retrograde_vedic") or [],
+        "timestamp":          signal.get("timestamp"),
     }
     return json.dumps({k: v for k, v in payload.items() if v is not None})
 
