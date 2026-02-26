@@ -160,6 +160,14 @@ MAX_DRAWDOWN_HALT_PCT = float(os.getenv("MAX_DRAWDOWN_HALT_PCT", "0.10"))
 MAX_OPEN_BARS         = int(os.getenv("MAX_OPEN_BARS", "12"))
 RR_RATIO              = float(os.getenv("RR_RATIO", "2.0"))
 ATR_MULTIPLIER        = float(os.getenv("ATR_MULTIPLIER", "1.5"))
+
+# ── Position monitor (book profit early) ───────────────────────────────────────
+# How often to check open positions for "book profit" (minutes). 0 = disabled.
+# When > 0, a separate loop runs every N minutes and closes any position whose
+# unrealized P&L has reached BOOK_PROFIT_AT_R (in "R" units).
+POSITION_CHECK_INTERVAL_MINUTES = int(os.getenv("POSITION_CHECK_INTERVAL_MINUTES", "15"))
+# Book profit when unrealized P&L >= this many R (e.g. 1.0 = lock in 1:1 win). 0 = off.
+BOOK_PROFIT_AT_R       = float(os.getenv("BOOK_PROFIT_AT_R", "0"))
 ATR_PERIOD            = 14
 
 # ── Leverage ──────────────────────────────────────────────────────────────────

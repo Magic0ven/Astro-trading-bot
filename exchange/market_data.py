@@ -187,21 +187,26 @@ def get_effective_capital() -> float:
     return capital
 
 
-def get_price_atr_ema(symbol: str) -> tuple[float, float, float]:
+def get_price_atr_ema(symbol: str) -> tuple[float, float, float, float, float]:
     """
-    Returns (current_price, atr, ema) all computed on 4h Hyperliquid candles.
+    Returns (current_price, atr, ema, last_candle_high, last_candle_low).
 
-    Fetches enough candles to warm up both ATR(14) and EMA(20).
-    This is the primary function called by bot_cycle every 4 hours.
+    last_candle_high/low are from the most recently closed 4h bar. Used for
+    intrabar TP/SL checks in paper mode (so we detect TP hit when price
+    wicks to target then bounces within the same bar).
     """
     needed = max(config.ATR_PERIOD, config.EMA_PERIOD) + 20
     df    = fetch_ohlcv(symbol, timeframe="4h", limit=needed)
     price = get_current_price(symbol)
     atr   = compute_atr(df, period=config.ATR_PERIOD)
     ema   = compute_ema(df, period=config.EMA_PERIOD)
+
+    last_high = float(df["high"].iloc[-1]) if not df.empty else price
+    last_low  = float(df["low"].iloc[-1])  if not df.empty else price
+
     logger.info(
         f"{symbol} — Price: {price:.2f} | "
         f"ATR({config.ATR_PERIOD})/4h: {atr:.2f} | "
         f"EMA({config.EMA_PERIOD})/4h: {ema:.2f}"
     )
-    return price, atr, ema
+    return price, atr, ema, last_high, last_low

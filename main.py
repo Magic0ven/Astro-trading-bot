@@ -26,11 +26,12 @@ load_dotenv()
 import config
 from core.signal_engine import generate_signal
 from core.score_history import ScoreHistory
-from exchange.market_data import get_price_atr_ema, get_account_balance
+from exchange.market_data import get_price_atr_ema, get_account_balance, get_current_price
 from exchange.trade_executor import (
     dispatch_signal,
     check_and_close_stale_positions,
     check_paper_positions,
+    check_and_book_profit,
     update_peak_equity,
     get_paper_summary,
 )
@@ -200,15 +201,15 @@ def bot_cycle():
     check_and_close_stale_positions()
 
     # Fetch market data (price, ATR and EMA all on 4h candles)
-    price, atr, ema = get_price_atr_ema(symbol)
+    price, atr, ema, last_high, last_low = get_price_atr_ema(symbol)
     if price <= 0:
         logger.error("Failed to get price — skipping cycle.")
         return
 
-    # Paper P&L: check if any open paper positions hit SL or TP at current price
+    # Paper P&L: check TP/SL using intrabar high/low so we detect wicks (e.g. TP hit then bounce)
     closed_this_cycle = []
     if config.PAPER_TRADING:
-        closed_this_cycle = check_paper_positions(price)
+        closed_this_cycle = check_paper_positions(price, candle_high=last_high, candle_low=last_low)
 
     # Fetch live balance once; derive effective capital from it.
     # This avoids two separate API calls and keeps equity tracking consistent.
@@ -279,7 +280,31 @@ def main():
         coalesce=True,
     )
 
-    logger.info(f"Scheduler started — running every {config.CHECK_INTERVAL_MINUTES} minutes.")
+    # Position monitor: check open positions every N min and book profit if unrealized P&L >= BOOK_PROFIT_AT_R
+    if config.POSITION_CHECK_INTERVAL_MINUTES > 0 and config.BOOK_PROFIT_AT_R > 0:
+        def position_monitor_cycle():
+            symbol = asset_dna.get("symbol", "BTC/USDT")
+            price = get_current_price(symbol)
+            if price <= 0:
+                return
+            closed = check_and_book_profit(price)
+            if closed:
+                logger.info(f"[Position monitor] Booked profit on {len(closed)} position(s)")
+
+        scheduler.add_job(
+            position_monitor_cycle,
+            trigger="interval",
+            minutes=config.POSITION_CHECK_INTERVAL_MINUTES,
+            id="position_monitor",
+            max_instances=1,
+            coalesce=True,
+        )
+        logger.info(
+            f"Position monitor: every {config.POSITION_CHECK_INTERVAL_MINUTES} min, "
+            f"book profit when unrealized P&L >= {config.BOOK_PROFIT_AT_R}R"
+        )
+
+    logger.info(f"Scheduler started — bot every {config.CHECK_INTERVAL_MINUTES} min.")
     logger.info("Press Ctrl+C to stop.")
 
     try:

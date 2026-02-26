@@ -128,7 +128,12 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
              ema_filter: str = EMA_FILTER,
              nk_filter: bool = NK_FILTER,
              risk_pct: float = RISK_PCT,
-             starting_capital: float = CAPITAL) -> dict:
+             starting_capital: float = CAPITAL,
+             rr_ratio: float = None,
+             book_profit_at_r: float = 0) -> dict:
+    """book_profit_at_r: if > 0, close trade when unrealized PnL >= this many R (early book profit). 0 = off (earlier logic)."""
+    if rr_ratio is None:
+        rr_ratio = RR_RATIO
 
     # Resample to the requested cadence so ATR and intrabar highs/lows
     # reflect N-hour candles, not 1h candles.
@@ -194,6 +199,26 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
                         # Short receives positive rate, pays negative rate
                         equity += notional * rate
 
+            # Early book-profit: close when unrealized PnL >= book_profit_at_r R
+            book_profit_hit = False
+            if book_profit_at_r > 0 and not sl_hit:
+                # R-multiple profit level from entry
+                one_r_dist = abs(ot["entry"] - sl)
+                if one_r_dist <= 0:
+                    one_r_dist = ot["entry"] * 0.01
+                if ot["side"] == "BUY":
+                    profit_price = ot["entry"] + book_profit_at_r * one_r_dist
+                    if use_intrabar and has_hl:
+                        book_profit_hit = high >= profit_price
+                    else:
+                        book_profit_hit = close >= profit_price
+                else:
+                    profit_price = ot["entry"] - book_profit_at_r * one_r_dist
+                    if use_intrabar and has_hl:
+                        book_profit_hit = low <= profit_price
+                    else:
+                        book_profit_hit = close <= profit_price
+
             # Resolve exit
             def _rec(result, pnl):
                 return {
@@ -211,7 +236,7 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
                 trades.append(_rec("STOP", pnl))
                 ot = None
             elif tp_hit and not sl_hit:
-                pnl = ot["risk"] * RR_RATIO
+                pnl = ot["risk"] * rr_ratio
                 if use_fees: pnl -= ot["notional"] * TAKER_FEE
                 equity += pnl
                 trades.append(_rec("WIN", pnl))
@@ -221,6 +246,12 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
                 if use_fees: pnl -= ot["notional"] * TAKER_FEE
                 equity += pnl
                 trades.append(_rec("STOP_INTRABAR", pnl))
+                ot = None
+            elif book_profit_hit:
+                pnl = ot["risk"] * book_profit_at_r
+                if use_fees: pnl -= ot["notional"] * TAKER_FEE
+                equity += pnl
+                trades.append(_rec("BOOK_PROFIT", pnl))
                 ot = None
             elif age >= max_open_bars:
                 exit_price = close
@@ -268,7 +299,7 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             entry *= (1 + SLIPPAGE) if side == "BUY" else (1 - SLIPPAGE)
 
         sl = entry - sld if side == "BUY" else entry + sld
-        tp = entry + sld * RR_RATIO if side == "BUY" else entry - sld * RR_RATIO
+        tp = entry + sld * rr_ratio if side == "BUY" else entry - sld * rr_ratio
 
         # Notional = risk / stop_distance_pct
         stop_pct = abs(entry - sl) / entry
@@ -452,6 +483,65 @@ def compounded_growth(results: dict) -> tuple:
     return cagr, compound
 
 
+def _aggregate_yearly_results(results: dict) -> dict:
+    """Merge per-year stats {year: stats} into one aggregate stats dict."""
+    if not results:
+        return {}
+    all_trades = []
+    total_pnl = 0.0
+    total_bars = 0
+    bars_in_trade = 0
+    total_risk_dep = 0.0
+    monthly = {}
+    equity_curve = []
+    for s in results.values():
+        all_trades.extend(s.get("trade_list", []))
+        total_pnl += s.get("total", 0)
+        total_bars += s.get("total_bars", 0)
+        bars_in_trade += s.get("bars_in_trade", 0)
+        total_risk_dep += s.get("total_risk_deployed", 0)
+        for m, md in s.get("monthly", {}).items():
+            monthly.setdefault(m, {"pnl": 0, "wins": 0, "total": 0})
+            monthly[m]["pnl"] += md["pnl"]
+            monthly[m]["wins"] += md["wins"]
+            monthly[m]["total"] += md["total"]
+        equity_curve.extend(s.get("equity_curve", []))
+    wins = [t for t in all_trades if t["pnl"] > 0]
+    losses = [t for t in all_trades if t["pnl"] <= 0]
+    n = len(all_trades)
+    wr = len(wins) / n * 100 if n else 0
+    avg_w = float(np.mean([t["pnl"] for t in wins])) if wins else 0.0
+    avg_l = float(np.mean([t["pnl"] for t in losses])) if losses else 0.0
+    exp = (wr / 100 * avg_w + (1 - wr / 100) * avg_l) if n else 0.0
+    pnl_pct = total_pnl / CAPITAL * 100
+    end_equity = CAPITAL + total_pnl
+    eq, pk, dd = CAPITAL, CAPITAL, 0.0
+    for t in all_trades:
+        eq += t["pnl"]
+        pk = max(pk, eq)
+        dd = max(dd, pk - eq)
+    dd_pct = dd / CAPITAL * 100
+    c = list(results.values())[0].get("cadence", 4)
+    avg_hold_bars = float(np.mean([t["bars"] for t in all_trades])) if all_trades else 0
+    avg_notional = float(np.mean([t["notional"] for t in all_trades])) if all_trades else 0
+    lev = getattr(__import__("config"), "LEVERAGE", 3)
+    return {
+        "trades": n, "wins": len(wins), "losses": len(losses),
+        "wr": wr, "avg_win": avg_w, "avg_loss": avg_l, "exp": exp,
+        "total": total_pnl, "pnl_pct": pnl_pct, "end_equity": end_equity,
+        "max_dd": dd, "dd_pct": dd_pct, "trade_list": all_trades, "monthly": monthly,
+        "time_in_market_pct": bars_in_trade / total_bars * 100 if total_bars else 0,
+        "total_bars": total_bars, "bars_in_trade": bars_in_trade,
+        "avg_hold_bars": avg_hold_bars, "avg_hold_hours": avg_hold_bars * c,
+        "avg_notional": avg_notional, "avg_margin": avg_notional / lev,
+        "avg_margin_pct": avg_notional / lev / CAPITAL * 100,
+        "total_risk_deployed": total_risk_dep,
+        "return_on_risk": total_pnl / total_risk_dep * 100 if total_risk_dep else 0,
+        "idle_yield_est": sum(s.get("idle_yield_est", 0) for s in results.values()),
+        "cadence": c, "equity_curve": equity_curve,
+    }
+
+
 def _run_year(path, funding, cadence):
     df = pd.read_csv(path)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -567,6 +657,54 @@ def print_capital_efficiency(stats: dict, label: str):
     ))
 
 
+def print_book_profit_comparison(stats_no: dict, stats_yes: dict,
+                                  label: str, cadence: int, book_r: float):
+    """Side-by-side: no early book profit vs book profit at book_r R."""
+    t = Table(
+        "Metric", "No early book profit", f"Book profit @ {book_r}R",
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title=f"[bold]Early profit booking comparison — {label}[/bold]",
+        show_lines=True,
+    )
+    for (name, k_no, k_yes) in [
+        ("Trades", "trades", "trades"),
+        ("Wins", "wins", "wins"),
+        ("Losses", "losses", "losses"),
+        ("Win %", "wr", "wr"),
+        ("Total P&L ($)", "total", "total"),
+        ("P&L %", "pnl_pct", "pnl_pct"),
+        ("Max DD %", "dd_pct", "dd_pct"),
+        ("End Equity ($)", "end_equity", "end_equity"),
+        ("Expectancy/trade ($)", "exp", "exp"),
+    ]:
+        v_no = stats_no.get(k_no, 0)
+        v_yes = stats_yes.get(k_yes, 0)
+        if k_no in ("wr", "pnl_pct", "dd_pct"):
+            v_no_s = f"{v_no:.1f}%" if k_no == "wr" else f"{v_no:.2f}%" if k_no == "pnl_pct" else f"{v_no:.1f}%"
+            v_yes_s = f"{v_yes:.1f}%" if k_no == "wr" else f"{v_yes:.2f}%" if k_no == "pnl_pct" else f"{v_yes:.1f}%"
+        elif k_no in ("total", "exp"):
+            v_no_s = f"{v_no:+,.0f}"
+            v_yes_s = f"{v_yes:+,.0f}"
+        elif k_no == "end_equity":
+            v_no_s = f"{v_no:,.0f}"
+            v_yes_s = f"{v_yes:,.0f}"
+        else:
+            v_no_s = str(v_no)
+            v_yes_s = str(v_yes)
+        diff_ok = (k_no in ("total", "pnl_pct", "end_equity", "exp", "wr") and v_yes >= v_no) or \
+                  (k_no == "dd_pct" and v_yes <= v_no)
+        c = "green" if diff_ok else "red"
+        t.add_row(name, v_no_s, f"[{c}]{v_yes_s}[/{c}]")
+    console.print(t)
+
+    # Count BOOK_PROFIT exits in stats_yes
+    trades_yes = stats_yes.get("trade_list", [])
+    n_book = sum(1 for tr in trades_yes if tr.get("result") == "BOOK_PROFIT")
+    if n_book:
+        console.print(f"\n[dim]With early book profit: {n_book} trades closed at {book_r}R (BOOK_PROFIT).[/dim]\n")
+
+
 def print_single_period(stats: dict, label: str, cadence: int,
                          start_date: str, end_date: str):
     """
@@ -655,7 +793,8 @@ def print_single_period(stats: dict, label: str, cadence: int,
             res  = {"WIN": "[green]WIN[/green]",
                     "STOP": "[red]STOP[/red]",
                     "STOP_INTRABAR": "[red]STOP (intrabar)[/red]",
-                    "TIMEOUT": "[yellow]TIMEOUT[/yellow]"}.get(tr["result"], tr["result"])
+                    "TIMEOUT": "[yellow]TIMEOUT[/yellow]",
+                    "BOOK_PROFIT": "[green]BOOK_PROFIT[/green]"}.get(tr["result"], tr["result"])
             t2.add_row(
                 str(n),
                 f"[cyan]{tr['side']}[/cyan]",
@@ -672,7 +811,7 @@ def print_single_period(stats: dict, label: str, cadence: int,
 
 def run_risk_comparison(dfs: dict, funding: pd.Series,
                         cadence: int, risk_levels: list,
-                        label_prefix: str = ""):
+                        label_prefix: str = "", rr_ratio: float = RR_RATIO):
     """
     Run simulate() at each risk level and print a side-by-side comparison.
 
@@ -688,7 +827,7 @@ def run_risk_comparison(dfs: dict, funding: pd.Series,
                 df, funding, cadence=cadence,
                 use_intrabar=True, use_fees=True,
                 use_slippage=True, use_funding=True,
-                risk_pct=r,
+                risk_pct=r, rr_ratio=rr_ratio,
             )
         results_by_risk[r] = period_stats
 
@@ -891,6 +1030,12 @@ def main():
                         help="Compare multiple risk-per-trade levels side by side.")
     parser.add_argument("--risk-levels", type=str, default="0.5,1,2,3,5,7,10",
                         help="Comma-separated risk %% values to compare (default: 0.5,1,2,3,5,7,10).")
+    parser.add_argument("--rr", type=float, default=2.0,
+                        help="Risk:reward ratio for TP (e.g. 1.5 = TP at 1.5× SL distance). Default 2.0.")
+    parser.add_argument("--book-profit", type=float, default=0, metavar="R",
+                        help="If > 0, close trade when unrealized PnL reaches this many R (early book profit). 0 = off.")
+    parser.add_argument("--compare-book-profit", action="store_true",
+                        help="Run with and without early book-profit and print side-by-side (uses --book-profit value).")
     args = parser.parse_args()
 
     # ── Single-file mode (partial year / custom period) ────────────────────────
@@ -935,13 +1080,14 @@ def main():
         label = args.label or f"BTC {start_date} → {end_date}"
 
         console.print()
+        book_r = max(0.0, float(args.book_profit))
+        book_line = f"  |  Book profit: {book_r}R (early exit)" if book_r else ""
         console.print(Panel.fit(
             f"[bold cyan]Realistic Simulation — {label}[/bold cyan]\n"
             "[dim]Intrabar SL/TP  |  Slippage 0.05%  |  Fee 0.05%/side  |  "
             "Real funding rates[/dim]\n"
-            f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  "
-            f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  "
-            f"Cadence: {cadence}h[/dim]",
+            f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  RR {args.rr}:1  |  "
+            f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Cadence: {cadence}h{book_line}[/dim]",
             border_style="cyan",
         ))
 
@@ -953,12 +1099,26 @@ def main():
                 cadence=cadence,
                 risk_levels=risk_levels,
                 label_prefix=label,
+                rr_ratio=args.rr,
             )
+            return
+
+        if args.compare_book_profit and book_r > 0:
+            stats_no = simulate(df, funding, cadence=cadence,
+                                use_intrabar=True, use_fees=True,
+                                use_slippage=True, use_funding=True,
+                                rr_ratio=args.rr, book_profit_at_r=0)
+            stats_yes = simulate(df, funding, cadence=cadence,
+                                 use_intrabar=True, use_fees=True,
+                                 use_slippage=True, use_funding=True,
+                                 rr_ratio=args.rr, book_profit_at_r=book_r)
+            print_book_profit_comparison(stats_no, stats_yes, label, cadence, book_r)
             return
 
         stats = simulate(df, funding, cadence=cadence,
                          use_intrabar=True, use_fees=True,
-                         use_slippage=True, use_funding=True)
+                         use_slippage=True, use_funding=True,
+                         rr_ratio=args.rr, book_profit_at_r=book_r)
         print_single_period(stats, label, cadence, start_date, end_date)
 
         if args.compare_risk:
@@ -967,24 +1127,27 @@ def main():
                 cadence=cadence,
                 risk_levels=risk_levels,
                 label_prefix=label,
+                rr_ratio=args.rr,
             )
         return
 
     cadences  = [1, 2, 4, 8] if args.compare else [args.cadence]
     years     = [2022, 2023, 2024, 2025]
     funding   = load_funding_rates()
+    book_r    = max(0.0, float(args.book_profit))
 
     if funding.empty:
         console.print("[yellow]Warning: funding rate CSV not found — funding impact skipped.[/yellow]")
 
     console.print()
+    book_line_4y = f"  |  Book profit: {book_r}R (early exit)" if book_r else ""
     console.print(Panel.fit(
         "[bold cyan]Realistic 4-Year Backtest[/bold cyan]\n"
         "[dim]Proper N-hour OHLC candles  |  Intrabar SL/TP  |  "
         "Slippage 0.05%  |  Fee 0.05%/side  |  Real funding rates[/dim]\n"
         f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  "
         f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  "
-        f"Cadence: {', '.join(f'{c}h' for c in cadences)}[/dim]",
+        f"Cadence: {', '.join(f'{c}h' for c in cadences)}{book_line_4y}[/dim]",
         border_style="cyan",
     ))
 
@@ -999,7 +1162,46 @@ def main():
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         raw_dfs[y] = df
 
-    # Run simulations
+    # Run simulations (with optional compare-book-profit: run two sets)
+    if args.compare_book_profit and book_r > 0:
+        all_results_no = {}
+        all_results_yes = {}
+        for c in cadences:
+            all_results_no[c] = {}
+            all_results_yes[c] = {}
+            for y, df in raw_dfs.items():
+                console.print(f"[dim]Simulating {y} @ {c}h (no book / {book_r}R book)...[/dim]", end="\r")
+                all_results_no[c][y] = simulate(df, funding, cadence=c,
+                                                use_intrabar=True, use_fees=True,
+                                                use_slippage=True, use_funding=True,
+                                                rr_ratio=args.rr, book_profit_at_r=0)
+                all_results_yes[c][y] = simulate(df, funding, cadence=c,
+                                                 use_intrabar=True, use_fees=True,
+                                                 use_slippage=True, use_funding=True,
+                                                 rr_ratio=args.rr, book_profit_at_r=book_r)
+        console.print(" " * 60, end="\r")
+        for c in cadences:
+            agg_no = _aggregate_yearly_results(all_results_no[c])
+            agg_yes = _aggregate_yearly_results(all_results_yes[c])
+            console.rule(f"[bold]Early book profit @ {book_r}R vs no early book — {c}h cadence[/bold]")
+            print_book_profit_comparison(agg_no, agg_yes, f"4-Year Historical ({c}h)", c, book_r)
+            # Per-year table
+            t = Table(
+                "Year", "No book: P&L%", f"Book @ {book_r}R: P&L%", "No book: WR", f"Book @ {book_r}R: WR",
+                box=box.SIMPLE, header_style="bold",
+            )
+            for y in sorted(all_results_no[c].keys()):
+                sn, sy = all_results_no[c][y], all_results_yes[c][y]
+                pn, py = sn["pnl_pct"], sy["pnl_pct"]
+                wn, wy = sn["wr"], sy["wr"]
+                pc = "green" if py >= pn else "red"
+                wc = "green" if wy >= wn else "red"
+                t.add_row(str(y), f"{pn:+.1f}%", f"[{pc}]{py:+.1f}%[/{pc}]", f"{wn:.0f}%", f"[{wc}]{wy:.0f}%[/{wc}]")
+            console.print(t)
+            console.print()
+        return
+
+    # Run simulations (single run, possibly with book_profit)
     all_results = {}
     for c in cadences:
         all_results[c] = {}
@@ -1007,7 +1209,8 @@ def main():
             console.print(f"[dim]Simulating {y} @ {c}h...[/dim]", end="\r")
             all_results[c][y] = simulate(df, funding, cadence=c,
                                          use_intrabar=True, use_fees=True,
-                                         use_slippage=True, use_funding=True)
+                                         use_slippage=True, use_funding=True,
+                                         rr_ratio=args.rr, book_profit_at_r=book_r)
     console.print(" " * 50, end="\r")
 
     if args.compare:

@@ -62,12 +62,16 @@ def init_schema():
                     notes           TEXT,
                     close_price     DOUBLE PRECISION,
                     pnl             DOUBLE PRECISION,
-                    result          TEXT
+                    result          TEXT,
+                    full_signal     TEXT
                 )
             """)
-            # Add user_id to existing deployments that may have been created without it
             try:
                 cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT 'default'")
+            except Exception:
+                pass
+            try:
+                cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS full_signal TEXT")
             except Exception:
                 pass
             cur.execute("""
@@ -87,7 +91,7 @@ def init_schema():
 # ── Signal / trade log ─────────────────────────────────────────────────────────
 
 def pg_log_signal(signal: dict, paper: bool, notes: str = "",
-                  user_id: str = None):
+                  user_id: str = None, full_signal_json: str = None):
     uid = user_id or BOT_USER_ID
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -97,13 +101,13 @@ def pg_log_signal(signal: dict, paper: bool, notes: str = "",
                     timestamp, asset, symbol, action,
                     entry_price, stop_loss, target, position_usdt,
                     western_score, vedic_score, western_slope, vedic_slope,
-                    numerology_mult, nakshatra, paper, notes
+                    numerology_mult, nakshatra, paper, notes, full_signal
                 ) VALUES (
                     %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s, %s
                 )
             """, (
                 uid,
@@ -123,6 +127,7 @@ def pg_log_signal(signal: dict, paper: bool, notes: str = "",
                 signal.get("nakshatra"),
                 1 if paper else 0,
                 notes,
+                full_signal_json or "",
             ))
         conn.commit()
 
@@ -183,7 +188,8 @@ def pg_query_signals(limit: int = 200, closed_only: bool = False,
                     vedic_slope    AS vedic_signal,
                     nakshatra, entry_price, stop_loss, target,
                     position_usdt  AS position_size_usdt,
-                    paper, close_price, pnl, result, notes
+                    paper, close_price, pnl, result, notes,
+                    full_signal
                 FROM signals
                 {where}
                 ORDER BY id DESC

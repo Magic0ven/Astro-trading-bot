@@ -53,6 +53,45 @@ OPEN_POSITIONS_FILE  = _LOGS_DIR / "open_positions.json"
 EQUITY_STATE_FILE    = _LOGS_DIR / "equity_state.json"
 
 
+# ── Full signal payload for frontend display ───────────────────────────────────
+
+def _full_signal_payload(signal: dict) -> str:
+    """Build a JSON-serializable dict with all display fields (console-style)."""
+    num = signal.get("numerology") or {}
+    payload = {
+        "action":            signal.get("final_action"),
+        "asset":             signal.get("asset"),
+        "symbol":             signal.get("symbol"),
+        "current_price":      signal.get("current_price"),
+        "stop_loss":          signal.get("stop_loss"),
+        "target":             signal.get("target"),
+        "position_size_usdt": signal.get("position_size_usdt"),
+        "effective_capital":  signal.get("effective_capital"),
+        "capital_pct":        getattr(config, "CAPITAL_PCT", 1.0),
+        "western_score":      signal.get("western_score"),
+        "vedic_score":        signal.get("vedic_score"),
+        "western_medium":     signal.get("western_medium"),
+        "vedic_medium":       signal.get("vedic_medium"),
+        "western_slope":      signal.get("western_slope"),
+        "vedic_slope":        signal.get("vedic_slope"),
+        "western_signal":     signal.get("western_signal"),
+        "vedic_signal":       signal.get("vedic_signal"),
+        "filter_reason":      signal.get("filter_reason"),
+        "ema_value":          signal.get("ema_value"),
+        "ema_filter":         getattr(config, "EMA_FILTER", ""),
+        "numerology_label":   num.get("label"),
+        "numerology_mult":    num.get("multiplier"),
+        "universal_day_number": num.get("universal_day_number"),
+        "life_path_number":   num.get("life_path_number"),
+        "nakshatra":          signal.get("nakshatra"),
+        "nakshatra_multiplier": signal.get("nakshatra_multiplier"),
+        "moon_fast":          signal.get("moon_fast"),
+        "retrograde_western": signal.get("retrograde_western") or [],
+        "retrograde_vedic":   signal.get("retrograde_vedic") or [],
+    }
+    return json.dumps({k: v for k, v in payload.items() if v is not None})
+
+
 # ── SQLite trade log ───────────────────────────────────────────────────────────
 
 def _init_db():
@@ -78,15 +117,15 @@ def _init_db():
             notes           TEXT,
             close_price     REAL,
             pnl             REAL,
-            result          TEXT
+            result          TEXT,
+            full_signal     TEXT
         )
     """)
-    # Add columns to existing DBs that pre-date the pnl tracking feature
-    for col, coltype in [("close_price", "REAL"), ("pnl", "REAL"), ("result", "TEXT")]:
+    for col, coltype in [("close_price", "REAL"), ("pnl", "REAL"), ("result", "TEXT"), ("full_signal", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {coltype}")
         except Exception:
-            pass  # column already exists
+            pass
     conn.commit()
     conn.close()
 
@@ -95,8 +134,9 @@ _init_db()
 
 
 def log_signal_to_db(signal: dict, paper: bool = True, notes: str = ""):
+    full_payload = _full_signal_payload(signal)
     if _USE_PG:
-        pg_log_signal(signal, paper, notes, user_id=_USER_ID)
+        pg_log_signal(signal, paper, notes, user_id=_USER_ID, full_signal_json=full_payload)
         return
     conn = sqlite3.connect(config.DB_PATH)
     conn.execute("""
@@ -104,8 +144,8 @@ def log_signal_to_db(signal: dict, paper: bool = True, notes: str = ""):
             timestamp, asset, symbol, action,
             entry_price, stop_loss, target, position_usdt,
             western_score, vedic_score, western_slope, vedic_slope,
-            numerology_mult, nakshatra, paper, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            numerology_mult, nakshatra, paper, notes, full_signal
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         signal.get("timestamp"),
         signal.get("asset"),
@@ -123,6 +163,7 @@ def log_signal_to_db(signal: dict, paper: bool = True, notes: str = ""):
         signal.get("nakshatra"),
         1 if paper else 0,
         notes,
+        full_payload,
     ))
     conn.commit()
     conn.close()
@@ -230,8 +271,8 @@ def _record_open_position(signal: dict, order_ids: dict = None):
     _save_open_positions(positions)
 
 
-def _force_close_live_position(pos: dict):
-    """Cancel SL/TP orders and market-close a live position that timed out."""
+def _close_live_position_at_market(pos: dict, reason: str = "CLOSE"):
+    """Cancel SL/TP orders and market-close a live position (timeout or book-profit)."""
     symbol = pos.get("symbol", "")
     action = pos.get("action", "")
     notional = pos.get("notional", 0.0)
@@ -240,25 +281,28 @@ def _force_close_live_position(pos: dict):
 
     try:
         ex = get_exchange()
-
         for order_key in ("sl_order_id", "tp_order_id"):
             oid = pos.get(order_key)
             if oid:
                 try:
                     ex.cancel_order(oid, symbol)
-                    logger.info(f"Cancelled order {oid} for timed-out {symbol} position")
+                    logger.info(f"Cancelled order {oid} for {symbol} ({reason})")
                 except Exception as e:
                     logger.warning(f"Could not cancel order {oid}: {e}")
-
         if qty > 0:
             close_side = "sell" if "BUY" in action else "buy"
             close_order = ex.create_market_order(
                 symbol, close_side, qty,
                 params={"reduceOnly": True}
             )
-            logger.info(f"TIMEOUT close: {symbol} {action} — order {close_order.get('id')}")
+            logger.info(f"{reason}: {symbol} {action} — order {close_order.get('id')}")
     except Exception as e:
-        logger.error(f"Failed to force-close live position {symbol}: {e}")
+        logger.error(f"Failed to close live position {symbol} ({reason}): {e}")
+
+
+def _force_close_live_position(pos: dict):
+    """Cancel SL/TP orders and market-close a live position that timed out."""
+    _close_live_position_at_market(pos, reason="TIMEOUT")
 
 
 def check_and_close_stale_positions():
@@ -378,16 +422,25 @@ def _calc_paper_pnl(pos: dict, close_price: float) -> float:
     return raw_pnl - fees
 
 
-def check_paper_positions(current_price: float) -> list[dict]:
+def check_paper_positions(
+    current_price: float,
+    candle_high: float = None,
+    candle_low: float = None,
+) -> list[dict]:
     """
-    Check all open paper positions against current_price.
+    Check all open paper positions for TP/SL hit.
 
-    For each position:
-      - LONG  (BUY):  TP hit if price ≥ target, SL hit if price ≤ stop_loss
-      - SHORT (SELL): TP hit if price ≤ target, SL hit if price ≥ stop_loss
+    Uses intrabar logic when candle_high/candle_low are provided (from the last
+    closed 4h bar): we consider TP hit if price *touched* the level during the
+    bar, even if it closed back the other way. This matches the backtest and
+    avoids "direction was right but TP didn't hit" when price wicks to TP then
+    bounces.
 
-    Returns a list of closed-position dicts (may be empty) so bot_cycle can
-    display P&L to the console.
+    - LONG  (BUY):  TP if high ≥ target,  SL if low ≤ stop_loss
+    - SHORT (SELL): TP if low ≤ target,   SL if high ≥ stop_loss
+
+    If both SL and TP are breached in the same bar, we assume SL first
+    (conservative, same as backtest).
     """
     positions = _load_open_positions()
     if not positions:
@@ -396,6 +449,8 @@ def check_paper_positions(current_price: float) -> list[dict]:
     closed   = []
     still_open = []
     state    = _load_equity_state()
+
+    use_intrabar = candle_high is not None and candle_low is not None
 
     for pos in positions:
         if not pos.get("paper", True):
@@ -410,16 +465,24 @@ def check_paper_positions(current_price: float) -> list[dict]:
         result     = None
         close_px   = None
 
+        if use_intrabar:
+            high = candle_high
+            low  = candle_low
+        else:
+            high = low = current_price
+
         if "BUY" in action:
-            if current_price >= target:
-                result, close_px = "TP", target
-            elif current_price <= stop_loss:
+            # Long: SL hit if price went down to stop_loss; TP if price went up to target
+            if low <= stop_loss:
                 result, close_px = "SL", stop_loss
+            elif high >= target:
+                result, close_px = "TP", target
         else:  # SELL / SHORT
-            if current_price <= target:
-                result, close_px = "TP", target
-            elif current_price >= stop_loss:
+            # Short: SL hit if price went up to stop_loss; TP if price went down to target
+            if high >= stop_loss:
                 result, close_px = "SL", stop_loss
+            elif low <= target:
+                result, close_px = "TP", target
 
         if result:
             pnl = _calc_paper_pnl(pos, close_px)
@@ -482,6 +545,125 @@ def check_paper_positions(current_price: float) -> list[dict]:
                 f"[PAPER CLOSE] {result} hit — {action} {pos.get('symbol')} | "
                 f"Entry: {entry:.2f} → Close: {close_px:.2f} | "
                 f"P&L: {'+'if pnl>=0 else ''}{pnl:.4f} USDT"
+            )
+        else:
+            still_open.append(pos)
+
+    if closed:
+        _save_open_positions(still_open)
+        _save_equity_state(state)
+
+    return closed
+
+
+def check_and_book_profit(current_price: float) -> list[dict]:
+    """
+    If BOOK_PROFIT_AT_R > 0: close any open position whose unrealized P&L
+    has reached that many R (e.g. 1.0 = lock in a 1:1 win). Called by a
+    separate scheduler job every POSITION_CHECK_INTERVAL_MINUTES so we can
+    book profit when price moves in our favor without waiting for the full TP.
+
+    Returns list of closed positions (for display), same shape as check_paper_positions.
+    """
+    if config.BOOK_PROFIT_AT_R <= 0:
+        return []
+
+    positions = _load_open_positions()
+    if not positions:
+        return []
+
+    closed   = []
+    still_open = []
+    state    = _load_equity_state()
+    now      = datetime.now(timezone.utc)
+
+    for pos in positions:
+        entry     = pos.get("entry_price", 0.0)
+        sl        = pos.get("stop_loss", 0.0)
+        notional  = pos.get("notional", 0.0)
+        action    = pos.get("action", "")
+
+        if entry <= 0 or notional <= 0:
+            still_open.append(pos)
+            continue
+
+        risk = abs(entry - sl) / entry * notional
+        if risk <= 0:
+            still_open.append(pos)
+            continue
+
+        unrealized_pnl = _calc_paper_pnl(pos, current_price)
+        pnl_r = unrealized_pnl / risk
+
+        if pnl_r >= config.BOOK_PROFIT_AT_R:
+            close_px = current_price
+            result   = "BOOK_PROFIT"
+            pnl      = unrealized_pnl
+
+            state["paper_pnl"]    = state.get("paper_pnl", 0.0) + pnl
+            state["paper_trades"] = state.get("paper_trades", 0) + 1
+            if pnl > 0:
+                state["paper_wins"]   = state.get("paper_wins", 0) + 1
+            else:
+                state["paper_losses"] = state.get("paper_losses", 0) + 1
+
+            if pos.get("paper", True):
+                _ts  = now.isoformat()
+                _sym = pos.get("symbol", "")
+                _notes = f"Book profit at {pnl_r:.2f}R (threshold {config.BOOK_PROFIT_AT_R}R)"
+                if _USE_PG:
+                    pg_log_close(
+                        symbol=_sym,
+                        action=f"CLOSE_{result}",
+                        entry_price=entry,
+                        stop_loss=sl,
+                        target=pos.get("target", 0),
+                        notional=notional,
+                        close_price=close_px,
+                        pnl=round(pnl, 4),
+                        result=result,
+                        notes=_notes,
+                        ts=_ts,
+                        user_id=_USER_ID,
+                    )
+                else:
+                    conn = sqlite3.connect(config.DB_PATH)
+                    conn.execute("""
+                        INSERT INTO signals (
+                            timestamp, asset, symbol, action,
+                            entry_price, stop_loss, target, position_usdt,
+                            paper, notes, close_price, pnl, result
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        _ts, _sym.split("/")[0], _sym, f"CLOSE_{result}",
+                        entry, sl, pos.get("target"), notional,
+                        1, _notes, close_px, round(pnl, 4), result,
+                    ))
+                    conn.commit()
+                    conn.close()
+            else:
+                _close_live_position_at_market(pos, reason="BOOK_PROFIT")
+                log_signal_to_db(
+                    {
+                        "timestamp": now.isoformat(),
+                        "asset": (pos.get("symbol") or "").split("/")[0],
+                        "symbol": pos.get("symbol"),
+                        "final_action": f"CLOSE_{result}",
+                        "current_price": close_px,
+                        "stop_loss": sl,
+                        "target": pos.get("target"),
+                        "position_size_usdt": notional,
+                        "numerology": {},
+                    },
+                    paper=False,
+                    notes=f"Book profit at {pnl_r:.2f}R (threshold {config.BOOK_PROFIT_AT_R}R)",
+                )
+
+            closed.append({**pos, "result": result, "close_price": close_px, "pnl": pnl})
+            logger.info(
+                f"[BOOK PROFIT] {result} @ {pnl_r:.2f}R — {action} {pos.get('symbol')} | "
+                f"Entry: {entry:.2f} → Close: {close_px:.2f} | "
+                f"P&L: {'+' if pnl >= 0 else ''}{pnl:.4f} USDT"
             )
         else:
             still_open.append(pos)
