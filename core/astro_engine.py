@@ -214,6 +214,65 @@ def get_retrograde_planets(positions: dict) -> list[str]:
     return [name for name, data in positions.items() if data["retrograde"] == -1]
 
 
+# ── Astro events for decisive overlay (best-call rules) ───────────────────────
+
+def _angular_sep(lon1: float, lon2: float) -> float:
+    """Separation in degrees [0, 180]."""
+    d = abs((lon1 - lon2) % 360)
+    return min(d, 360 - d)
+
+
+def get_astro_events(positions: dict, retrograde_western: list) -> dict:
+    """
+    Compute event flags used by the decisive overlay (win-rate best-call rules).
+    positions: Western tropical positions (e.g. from get_western_positions).
+    """
+    orb_conj = 10.0   # degrees for conjunction
+    orb_moon = 12.0   # degrees for new/full moon
+
+    def lon(name: str) -> float:
+        return positions.get(name, {}).get("longitude", 0.0)
+
+    sun, moon = lon("Sun"), lon("Moon")
+    sun_moon_sep = _angular_sep(sun, moon)
+
+    # Jupiter–Uranus conjunction → best call LONG
+    jupiter_uranus_active = _angular_sep(lon("Jupiter"), lon("Uranus")) <= orb_conj
+
+    # Saturn–Pluto conjunction → best call SHORT
+    saturn_pluto_active = _angular_sep(lon("Saturn"), lon("Pluto")) <= orb_conj
+
+    # Mercury retrograde → best call LONG
+    mercury_retrograde_active = "Mercury" in retrograde_western
+
+    # Saturn retrograde → best call LONG
+    saturn_retrograde_active = "Saturn" in retrograde_western
+
+    # Full moon (Sun–Moon opposition) → best call SHORT
+    full_moon_active = sun_moon_sep >= (180 - orb_moon) and sun_moon_sep <= (180 + orb_moon)
+
+    # New moon (Sun–Moon conjunction) → best call SHORT
+    new_moon_active = sun_moon_sep <= orb_moon or sun_moon_sep >= (360 - orb_moon)
+
+    # Moon phase angle 0–360 (0 = new, 180 = full, angle from Sun to Moon)
+    moon_phase_deg = (moon - sun) % 360
+
+    return {
+        "jupiter_uranus_active": jupiter_uranus_active,
+        "jupiter_uranus_best_call": "LONG",
+        "saturn_pluto_active": saturn_pluto_active,
+        "saturn_pluto_best_call": "SHORT",
+        "mercury_retrograde_active": mercury_retrograde_active,
+        "mercury_retrograde_best_call": "LONG",
+        "saturn_retrograde_active": saturn_retrograde_active,
+        "saturn_retrograde_best_call": "LONG",
+        "full_moon_active": full_moon_active,
+        "new_moon_active": new_moon_active,
+        "moon_phase_best_call": "SHORT",
+        "moon_phase_deg": moon_phase_deg,
+    }
+
+
 # ── Full Sky State ─────────────────────────────────────────────────────────────
 
 def get_sky_state(jd: Optional[float] = None) -> dict:
@@ -242,13 +301,17 @@ def get_sky_state(jd: Optional[float] = None) -> dict:
     nakshatra = config.get_nakshatra(moon_vedic_lon)
     nk_mult = config.nakshatra_multiplier(moon_vedic_lon)
 
+    retrograde_western = get_retrograde_planets(western)
+    astro_events = get_astro_events(western, retrograde_western)
+
     return {
         "jd": jd,
         "western": western,
         "vedic": vedic,
         "moon_fast": is_moon_fast(western),
-        "retrograde_planets_western": get_retrograde_planets(western),
+        "retrograde_planets_western": retrograde_western,
         "retrograde_planets_vedic": get_retrograde_planets(vedic),
         "nakshatra": nakshatra,
         "nakshatra_multiplier": nk_mult,
+        "astro_events": astro_events,
     }

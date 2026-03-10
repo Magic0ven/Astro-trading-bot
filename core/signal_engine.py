@@ -75,6 +75,45 @@ def dual_system_gate(western_signal: str, vedic_signal: str) -> str:
         return "NO_TRADE"
 
 
+# ── Decisive overlay (best-call rules from win-rate analysis) ──────────────────
+
+def apply_decisive_overlay(action: str, astro_events: Optional[dict] = None) -> str:
+    """
+    When an astro event is active, upgrade the weak signal in the event's best-call
+    direction to strong. Based on backtest win-rate:
+      Jupiter–Uranus conjunction → best call LONG
+      Saturn–Pluto conjunction   → best call SHORT
+      Mercury retrograde        → best call LONG
+      Saturn retrograde         → best call LONG
+      Full moon / new moon      → best call SHORT
+    """
+    if not astro_events:
+        return action
+
+    out = action
+
+    if astro_events.get("jupiter_uranus_active") and astro_events.get("jupiter_uranus_best_call") == "LONG":
+        if out == "WEAK_BUY":
+            out = "STRONG_BUY"
+    if astro_events.get("saturn_pluto_active") and astro_events.get("saturn_pluto_best_call") == "SHORT":
+        if out == "WEAK_SELL":
+            out = "STRONG_SELL"
+    if astro_events.get("mercury_retrograde_active") and astro_events.get("mercury_retrograde_best_call") == "LONG":
+        if out == "WEAK_BUY":
+            out = "STRONG_BUY"
+    if astro_events.get("saturn_retrograde_active") and astro_events.get("saturn_retrograde_best_call") == "LONG":
+        if out == "WEAK_BUY":
+            out = "STRONG_BUY"
+    if astro_events.get("full_moon_active") and astro_events.get("moon_phase_best_call") == "SHORT":
+        if out == "WEAK_SELL":
+            out = "STRONG_SELL"
+    if astro_events.get("new_moon_active") and astro_events.get("moon_phase_best_call") == "SHORT":
+        if out == "WEAK_SELL":
+            out = "STRONG_SELL"
+
+    return out
+
+
 # ── Position size calculator ───────────────────────────────────────────────────
 
 def calculate_position_size(
@@ -233,6 +272,7 @@ def generate_signal(
     western_signal = _system_signal(western_score_adj, w_medium, w_slope)
     vedic_signal = _system_signal(vedic_score_adj, v_medium, v_slope)
     final_action = dual_system_gate(western_signal, vedic_signal)
+    final_action = apply_decisive_overlay(final_action, sky.get("astro_events"))
 
     # 7. Reliability filters (must match backtest logic)
     filter_reason = None
@@ -242,6 +282,16 @@ def generate_signal(
         nk = sky["nakshatra"]
         if nk in config.TRADE_UNFAVORABLE_NAKSHATRAS:
             filter_reason = f"NAKSHATRA_BLOCK:{nk}"
+            final_action = "NO_TRADE"
+
+    # 7a2. Mercury / Saturn retrograde — block LONG only (shorts allowed; loss analysis)
+    if filter_reason is None and "BUY" in (final_action or ""):
+        rx_western = sky.get("retrograde_planets_western") or []
+        if config.MERCURY_RX_BLOCK and "Mercury" in rx_western:
+            filter_reason = "MERCURY_RX_BLOCK_LONG"
+            final_action = "NO_TRADE"
+        elif config.SATURN_RX_BLOCK and "Saturn" in rx_western:
+            filter_reason = "SATURN_RX_BLOCK_LONG"
             final_action = "NO_TRADE"
 
     # 7b. EMA trend filter — skip trades that fight the short-term trend

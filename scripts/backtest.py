@@ -1,12 +1,14 @@
 """
 Backtest — replay historical planetary positions against historical prices.
 
-Usage:
-    python scripts/backtest.py --asset BTC --start 2024-01-01 --end 2024-12-31
-    python scripts/backtest.py --asset BTC --start 2023-01-01 --interval 4
+Runs at 4h cadence by default (matches live bot and final_backtest).
+One signal per `interval` hours; each row = one candle close.
 
-The bot simulates one signal per `interval` hours over the date range.
-Results are printed to console and saved to logs/backtest_{asset}_{date}.csv
+Usage:
+    python scripts/backtest.py --asset BTC --start 2024-01-01 --end 2024-12-31   # 4h
+    python scripts/backtest.py --asset BTC --start 2023-01-01 --interval 1       # 1h
+
+Results are saved to logs/backtest_{asset}_{date}.csv
 """
 import argparse
 import json
@@ -23,7 +25,7 @@ import config
 from core.astro_engine import datetime_to_jd, get_sky_state, compute_composite_score
 from core.numerology import full_numerology_report, numerology_multiplier
 from core.score_history import ScoreHistory
-from core.signal_engine import _system_signal, dual_system_gate
+from core.signal_engine import _system_signal, dual_system_gate, apply_decisive_overlay
 
 # Suppress info logs during backtest
 logger.remove()
@@ -136,11 +138,16 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
         candle = get_candle_at(price_df, current)
         action = "COLLECTING_DATA"
 
+        gate = "COLLECTING_DATA"
         if score_history.is_ready():
             ws = _system_signal(w_score, hist["western"]["medium"], hist["western"]["slope"])
             vs = _system_signal(v_score, hist["vedic"]["medium"], hist["vedic"]["slope"])
-            action = dual_system_gate(ws, vs)
+            gate = dual_system_gate(ws, vs)
+            action = apply_decisive_overlay(gate, sky.get("astro_events"))
+        else:
+            action = "COLLECTING_DATA"
 
+        events = sky.get("astro_events") or {}
         results.append({
             "timestamp":    current.isoformat(),
             "open":         candle["open"],
@@ -148,12 +155,20 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
             "low":          candle["low"],
             "price":        candle["close"],   # keep "price" = close for backward compat
             "action":       action,
+            "action_no_overlay": gate,  # for --compare-overlay in final_backtest
             "western_score":  round(w_score, 4),
             "vedic_score":    round(v_score, 4),
             "western_slope":  round(hist["western"]["slope"] or 0, 4),
             "vedic_slope":    round(hist["vedic"]["slope"] or 0, 4),
             "resonance_day":  num_report["resonance_match"],
             "nakshatra":      sky["nakshatra"],
+            "jupiter_uranus_active":   events.get("jupiter_uranus_active", False),
+            "saturn_pluto_active":     events.get("saturn_pluto_active", False),
+            "mercury_retrograde_active": events.get("mercury_retrograde_active", False),
+            "saturn_retrograde_active":  events.get("saturn_retrograde_active", False),
+            "full_moon_active":        events.get("full_moon_active", False),
+            "new_moon_active":         events.get("new_moon_active", False),
+            "moon_phase_deg":          round(events.get("moon_phase_deg", 0), 2),
         })
 
         current += timedelta(hours=interval_hours)
@@ -201,7 +216,7 @@ def main():
     parser.add_argument("--asset", type=str, default="BTC")
     parser.add_argument("--start", type=str, default="2024-01-01")
     parser.add_argument("--end", type=str, default="2024-12-31")
-    parser.add_argument("--interval", type=int, default=1, help="Hours between signals")
+    parser.add_argument("--interval", type=int, default=4, help="Hours between signals (default 4 = 4h cadence)")
     args = parser.parse_args()
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)

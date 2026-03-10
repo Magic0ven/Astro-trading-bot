@@ -314,27 +314,32 @@ def make_chart(summary: dict, title: str, out_path: Path):
 
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
+    # Default: 2022–2025 full backtest (realistic engine algo)
+    default_files = [
+        str(ROOT / "logs" / f"backtest_BTC_{y}-01-01_{y}-12-31.csv")
+        for y in (2022, 2023, 2024, 2025)
+    ]
     parser = argparse.ArgumentParser(description="Astro-Bot backtest chart generator")
     parser.add_argument(
         "--file", nargs="+",
-        default=[str(ROOT / "logs" / "backtest_BTC_2026-01-01_2026-02-23.csv")],
-        help="One or more backtest CSV files (space-separated for multi-year)",
+        default=default_files,
+        help="One or more backtest CSV files (default: 2022–2025)",
     )
     parser.add_argument(
         "--funding-file",
-        default=str(ROOT / "logs" / "funding_BTCUSDT_2026-01-01_2026-02-23.csv"),
+        default=str(ROOT / "logs" / "funding_BTCUSDT_2022-01-01_2025-12-31.csv"),
         help="Funding rates CSV",
     )
     parser.add_argument("--cadence", type=int, default=4,
                         help="Candle size in hours (default 4 — matches live bot)")
-    parser.add_argument("--title", default="2026 YTD",  help="Chart title")
+    parser.add_argument("--title", default="2022–2025 Full Backtest",  help="Chart title")
     parser.add_argument("--out",   default="",          help="Output PNG path (auto if blank)")
     args = parser.parse_args()
 
     out_path = (
         Path(args.out)
         if args.out
-        else ROOT / "logs" / f"chart_{args.title.replace(' ', '_').lower()}.png"
+        else ROOT / "logs" / f"chart_{args.title.replace(' ', '_').replace('–', '_').lower()}.png"
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
 

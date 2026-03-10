@@ -86,6 +86,12 @@ NAKSHATRAS = [
 
 NAKSHATRA_FILTER = os.getenv("NAKSHATRA_FILTER", "false").lower() == "true"
 
+# Block opening LONG positions when Mercury or Saturn is retrograde (shorts allowed).
+# Loss analysis: longs lose heavily during Mercury RX and Saturn RX; shorts are better or neutral.
+# Set to false in .env to allow longs during these periods.
+MERCURY_RX_BLOCK = os.getenv("MERCURY_RX_BLOCK", "true").lower() == "true"
+SATURN_RX_BLOCK  = os.getenv("SATURN_RX_BLOCK", "true").lower() == "true"
+
 TRADE_FAVORABLE_NAKSHATRAS = {
     "Rohini", "Hasta", "Punarvasu", "Shatabhisha", "Anuradha",
 }

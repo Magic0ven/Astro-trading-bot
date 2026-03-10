@@ -26,8 +26,8 @@ Improvements over the naive close-only simulation:
    every 8 hours while a trade is open.
 
 Usage:
-    python scripts/final_backtest.py                  # default 1h cadence
-    python scripts/final_backtest.py --cadence 4      # 4h candles
+    python scripts/final_backtest.py                  # default 4h cadence
+    python scripts/final_backtest.py --cadence 1      # 1h candles
     python scripts/final_backtest.py --compare        # all cadences side-by-side
 """
 import argparse
@@ -43,6 +43,10 @@ from rich import box
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
+try:
+    from core.trend_predictor import predictor_actions
+except ImportError:
+    predictor_actions = None  # optional; used only for --compare-predictor
 
 console = Console(width=180)
 
@@ -56,8 +60,10 @@ INTERVAL      = 1             # rows to skip (1 = every candle = true 1h cadence
 MAX_OPEN_BARS = 48            # 48 × 1h = 48h max hold
 EMA_PERIOD    = config.EMA_PERIOD          # read from config / .env
 EMA_FILTER    = config.EMA_FILTER          # "none" | "one_way" | "two_way"
-NK_FILTER     = config.NAKSHATRA_FILTER    # True / False
-TAKER_FEE     = 0.0005        # 0.05% per side (Hyperliquid taker)
+NK_FILTER         = config.NAKSHATRA_FILTER    # True / False
+MERCURY_RX_BLOCK  = getattr(config, "MERCURY_RX_BLOCK", True)
+SATURN_RX_BLOCK   = getattr(config, "SATURN_RX_BLOCK", True)
+TAKER_FEE         = 0.0005        # 0.05% per side (Hyperliquid taker)
 SLIPPAGE      = 0.0005        # 0.05% entry slippage (market order spread)
 BLOCKED       = config.TRADE_UNFAVORABLE_NAKSHATRAS
 FUNDING_CSV   = Path("logs/funding_BTCUSDT_2022-01-01_2025-12-31.csv")
@@ -92,7 +98,11 @@ def resample_to_nh(df: pd.DataFrame, hours: int) -> pd.DataFrame:
 
     signal_cols = [c for c in
                    ["action", "nakshatra", "western_score", "vedic_score",
-                    "western_slope", "vedic_slope", "resonance_day"]
+                    "western_slope", "vedic_slope", "resonance_day",
+                    "full_moon_active", "new_moon_active",
+                    "jupiter_uranus_active", "saturn_pluto_active",
+                    "mercury_retrograde_active", "saturn_retrograde_active",
+                    "moon_phase_deg"]
                    if c in df.columns]
 
     freq = f"{hours}h"
@@ -127,6 +137,8 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
              ema_period: int = EMA_PERIOD,
              ema_filter: str = EMA_FILTER,
              nk_filter: bool = NK_FILTER,
+             mercury_rx_block: bool = MERCURY_RX_BLOCK,
+             saturn_rx_block: bool = SATURN_RX_BLOCK,
              risk_pct: float = RISK_PCT,
              starting_capital: float = CAPITAL,
              rr_ratio: float = None,
@@ -221,7 +233,7 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
 
             # Resolve exit
             def _rec(result, pnl):
-                return {
+                out = {
                     "pnl": pnl, "result": result,
                     "month": ot["month"], "side": ot["side"],
                     "signal": ot["signal"], "entry": ot["entry"],
@@ -229,6 +241,13 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
                     "bars": age + 1, "notional": ot["notional"],
                     "risk": ot["risk"],
                 }
+                for k in ("nakshatra", "resonance_day", "western_score", "vedic_score",
+                         "western_slope", "vedic_slope", "full_moon_active", "new_moon_active",
+                         "jupiter_uranus_active", "saturn_pluto_active",
+                         "mercury_retrograde_active", "saturn_retrograde_active", "moon_phase_deg"):
+                    if k in ot:
+                        out[k] = ot[k]
+                return out
             if sl_hit and not tp_hit:
                 pnl = -ot["risk"]
                 if use_fees: pnl -= ot["notional"] * TAKER_FEE
@@ -273,6 +292,11 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             continue
         if nk_filter and naks in BLOCKED:
             continue
+        # Block longs only during Mercury/Saturn RX (shorts allowed)
+        if mercury_rx_block and "BUY" in action and row.get("mercury_retrograde_active") in (True, "True", 1):
+            continue
+        if saturn_rx_block and "BUY" in action and row.get("saturn_retrograde_active") in (True, "True", 1):
+            continue
         if ot:
             continue
 
@@ -313,6 +337,12 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             "risk": risk, "notional": notional,
             "age": 0, "month": month, "open_ts": str(ts)[:16],
         }
+        for k in ("nakshatra", "resonance_day", "western_score", "vedic_score",
+                  "western_slope", "vedic_slope", "full_moon_active", "new_moon_active",
+                  "jupiter_uranus_active", "saturn_pluto_active",
+                  "mercury_retrograde_active", "saturn_retrograde_active", "moon_phase_deg"):
+            if k in row.index and pd.notna(row.get(k)):
+                ot[k] = row[k]
 
     # ── Aggregate stats ────────────────────────────────────────────────────────
     wins    = [t for t in trades if t["pnl"] > 0]
@@ -657,6 +687,52 @@ def print_capital_efficiency(stats: dict, label: str):
     ))
 
 
+def print_overlay_comparison(agg_with: dict, agg_without: dict, cadence: int = 4):
+    """Side-by-side: with decisive overlay (best-call rules) vs without (gate only)."""
+    t = Table(
+        "Metric", "Without overlay (gate only)", "With overlay (best-call)",
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title=f"[bold]Decisive overlay comparison — {cadence}h cadence[/bold]",
+        show_lines=True,
+    )
+    for (name, key) in [
+        ("Trades", "trades"),
+        ("Wins", "wins"),
+        ("Win %", "wr"),
+        ("Total P&L ($)", "total"),
+        ("P&L %", "pnl_pct"),
+        ("Max DD %", "dd_pct"),
+        ("End Equity ($)", "end_equity"),
+        ("Expectancy/trade ($)", "exp"),
+    ]:
+        v_no = agg_without.get(key, 0)
+        v_yes = agg_with.get(key, 0)
+        if key in ("wr", "pnl_pct", "dd_pct"):
+            v_no_s = f"{v_no:.1f}%" if key == "wr" else f"{v_no:.2f}%" if key == "pnl_pct" else f"{v_no:.1f}%"
+            v_yes_s = f"{v_yes:.1f}%" if key == "wr" else f"{v_yes:.2f}%" if key == "pnl_pct" else f"{v_yes:.1f}%"
+        elif key in ("total", "exp"):
+            v_no_s = f"{v_no:+,.0f}"
+            v_yes_s = f"{v_yes:+,.0f}"
+        elif key == "end_equity":
+            v_no_s = f"{v_no:,.0f}"
+            v_yes_s = f"{v_yes:,.0f}"
+        else:
+            v_no_s = str(v_no)
+            v_yes_s = str(v_yes)
+        better = (key in ("total", "pnl_pct", "end_equity", "exp", "wr") and v_yes >= v_no) or (key == "dd_pct" and v_yes <= v_no)
+        c = "green" if better else "red"
+        t.add_row(name, v_no_s, f"[{c}]{v_yes_s}[/{c}]")
+    console.print(t)
+    n = 4
+    cagr_no = ((agg_without["end_equity"] / CAPITAL) ** (1 / n) - 1) * 100
+    cagr_yes = ((agg_with["end_equity"] / CAPITAL) ** (1 / n) - 1) * 100
+    console.print(f"\n  [dim]CAGR (4y):  Without overlay: {cagr_no:.1f}%   |   With overlay: {cagr_yes:.1f}%[/dim]")
+    winner = "With overlay" if agg_with["end_equity"] >= agg_without["end_equity"] else "Without overlay"
+    console.print(Panel(f"  [bold]Higher end equity:[/bold] [green]{winner}[/green]", title="[bold]Verdict[/bold]", border_style="green"))
+    console.print()
+
+
 def print_book_profit_comparison(stats_no: dict, stats_yes: dict,
                                   label: str, cadence: int, book_r: float):
     """Side-by-side: no early book profit vs book profit at book_r R."""
@@ -736,7 +812,7 @@ def print_single_period(stats: dict, label: str, cadence: int,
         f"([dim]{days} days[/dim])\n"
         f"  Cadence :  [bold]{cadence}h[/bold] candles   |   "
         f"EMA({EMA_PERIOD}) {EMA_FILTER}   |   "
-        f"NK filter: {'ON' if NK_FILTER else 'OFF'}\n\n"
+        f"NK filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX: {'ON' if SATURN_RX_BLOCK else 'OFF'}\n\n"
         f"  Trades  :  {stats['trades']}  "
         f"([green]{stats['wins']} wins[/green] / [red]{stats['losses']} losses[/red])   "
         f"Win rate: [{wc}]{stats['wr']:.1f}%[/{wc}]\n"
@@ -1016,8 +1092,8 @@ def run_risk_comparison(dfs: dict, funding: pd.Series,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cadence", type=int, default=1,
-                        help="Candle size in hours (1, 2, 4, 8). Default 1.")
+    parser.add_argument("--cadence", type=int, default=4,
+                        help="Candle size in hours (1, 2, 4, 8). Default 4.")
     parser.add_argument("--compare", action="store_true",
                         help="Compare all cadences (1h, 2h, 4h, 8h) side-by-side")
     parser.add_argument("--file", type=str, default=None,
@@ -1036,6 +1112,8 @@ def main():
                         help="If > 0, close trade when unrealized PnL reaches this many R (early book profit). 0 = off.")
     parser.add_argument("--compare-book-profit", action="store_true",
                         help="Run with and without early book-profit and print side-by-side (uses --book-profit value).")
+    parser.add_argument("--compare-overlay", action="store_true",
+                        help="Compare with vs without decisive overlay (best-call rules). Needs CSVs with action_no_overlay column (re-run backtest.py).")
     args = parser.parse_args()
 
     # ── Single-file mode (partial year / custom period) ────────────────────────
@@ -1087,7 +1165,7 @@ def main():
             "[dim]Intrabar SL/TP  |  Slippage 0.05%  |  Fee 0.05%/side  |  "
             "Real funding rates[/dim]\n"
             f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  RR {args.rr}:1  |  "
-            f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Cadence: {cadence}h{book_line}[/dim]",
+            f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX block: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX block: {'ON' if SATURN_RX_BLOCK else 'OFF'}  |  Cadence: {cadence}h{book_line}[/dim]",
             border_style="cyan",
         ))
 
@@ -1146,7 +1224,7 @@ def main():
         "[dim]Proper N-hour OHLC candles  |  Intrabar SL/TP  |  "
         "Slippage 0.05%  |  Fee 0.05%/side  |  Real funding rates[/dim]\n"
         f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  "
-        f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  "
+        f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX: {'ON' if SATURN_RX_BLOCK else 'OFF'}  |  "
         f"Cadence: {', '.join(f'{c}h' for c in cadences)}{book_line_4y}[/dim]",
         border_style="cyan",
     ))
@@ -1161,6 +1239,36 @@ def main():
         df = pd.read_csv(path)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         raw_dfs[y] = df
+
+    # ── Compare with vs without decisive overlay ───────────────────────────────
+    if args.compare_overlay and raw_dfs:
+        if not all("action_no_overlay" in df.columns for df in raw_dfs.values()):
+            console.print(
+                "[yellow]All CSVs need 'action_no_overlay' column. "
+                "Re-run backtest for 2022–2025 to regenerate CSVs, then run again with --compare-overlay.[/yellow]"
+            )
+            return
+        cadence = args.cadence
+        all_with = {}
+        all_without = {}
+        for y, df in raw_dfs.items():
+            console.print(f"[dim]Comparing overlay for {y} @ {cadence}h...[/dim]", end="\r")
+            all_with[y] = simulate(df, funding, cadence=cadence,
+                                  use_intrabar=True, use_fees=True,
+                                  use_slippage=True, use_funding=True,
+                                  rr_ratio=args.rr, book_profit_at_r=book_r)
+            df_no = df.copy()
+            df_no["action"] = df_no["action_no_overlay"]
+            all_without[y] = simulate(df_no, funding, cadence=cadence,
+                                     use_intrabar=True, use_fees=True,
+                                     use_slippage=True, use_funding=True,
+                                     rr_ratio=args.rr, book_profit_at_r=book_r)
+        console.print(" " * 50, end="\r")
+        agg_with = _aggregate_yearly_results(all_with)
+        agg_without = _aggregate_yearly_results(all_without)
+        console.rule("[bold]With vs without decisive overlay (best-call rules)[/bold]")
+        print_overlay_comparison(agg_with, agg_without, cadence)
+        return
 
     # Run simulations (with optional compare-book-profit: run two sets)
     if args.compare_book_profit and book_r > 0:
