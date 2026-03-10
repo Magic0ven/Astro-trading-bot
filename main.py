@@ -34,6 +34,11 @@ from exchange.trade_executor import (
     check_and_book_profit,
     update_peak_equity,
     get_paper_summary,
+    get_paper_effective_capital,
+    get_paper_equity,
+    get_open_positions,
+    close_paper_positions_at_market,
+    has_open_position_opposite_direction,
 )
 
 console = Console()
@@ -211,17 +216,25 @@ def bot_cycle():
     if config.PAPER_TRADING:
         closed_this_cycle = check_paper_positions(price, candle_high=last_high, candle_low=last_low)
 
-    # Fetch live balance once; derive effective capital from it.
-    # This avoids two separate API calls and keeps equity tracking consistent.
+    # Capital for position sizing: paper uses paper equity; live uses exchange balance
     balance = get_account_balance()
-    capital = balance * config.CAPITAL_PCT
-    logger.info(
-        f"Effective capital: ${capital:,.2f}  "
-        f"({config.CAPITAL_PCT*100:.0f}% of ${balance:,.2f} balance)"
-    )
+    if config.PAPER_TRADING:
+        capital = get_paper_effective_capital()
+        current_equity = get_paper_equity()  # paper equity for drawdown check
+        logger.info(
+            f"Paper effective capital: ${capital:,.2f}  "
+            f"({config.CAPITAL_PCT*100:.0f}% of paper equity ${current_equity:,.2f})"
+        )
+    else:
+        capital = balance * config.CAPITAL_PCT
+        current_equity = balance
+        logger.info(
+            f"Effective capital: ${capital:,.2f}  "
+            f"({config.CAPITAL_PCT*100:.0f}% of ${balance:,.2f} balance)"
+        )
 
     # Gap 3: update peak-equity record and arm the drawdown halt if needed
-    update_peak_equity(balance)
+    update_peak_equity(current_equity)
 
     # Generate signal (EMA filter + Nakshatra block applied inside)
     signal = generate_signal(
@@ -233,12 +246,26 @@ def bot_cycle():
         capital=capital,
     )
 
+    # Paper: on opposite signal, close existing position first then re-size with updated capital
+    if config.PAPER_TRADING:
+        open_positions = get_open_positions()
+        if open_positions and has_open_position_opposite_direction(signal, open_positions):
+            close_paper_positions_at_market(price)
+            capital = get_paper_effective_capital()
+            signal = generate_signal(
+                asset_dna=asset_dna,
+                score_history=score_history,
+                current_price=price,
+                atr=atr,
+                current_ema=ema,
+                capital=capital,
+            )
+
     # Display signal
     display_signal(signal)
 
     # Execute / paper trade
-    # current_equity=balance passes the full account balance for drawdown check
-    dispatch_signal(signal, current_equity=balance)
+    dispatch_signal(signal, current_equity=current_equity)
 
     # Display paper P&L panel (paper mode only)
     if config.PAPER_TRADING:

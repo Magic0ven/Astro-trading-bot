@@ -372,12 +372,13 @@ def _load_equity_state() -> dict:
         with open(EQUITY_STATE_FILE) as f:
             return json.load(f)
     return {
-        "peak_equity":    0.0,
-        "paper_pnl":      0.0,
-        "paper_trades":   0,
-        "paper_wins":     0,
-        "paper_losses":   0,
-        "paper_timeouts": 0,
+        "peak_equity":           0.0,
+        "paper_pnl":             0.0,
+        "paper_trades":          0,
+        "paper_wins":            0,
+        "paper_losses":          0,
+        "paper_timeouts":        0,
+        "paper_starting_equity": config.CAPITAL_USDT,
     }
 
 
@@ -393,6 +394,142 @@ def _save_equity_state(state: dict):
 def get_paper_summary() -> dict:
     """Return the current paper trading P&L summary from equity_state.json."""
     return _load_equity_state()
+
+
+def get_paper_equity() -> float:
+    """
+    Paper equity = starting capital + cumulative paper PnL.
+    Used for position sizing in paper mode so size scales with paper performance.
+    """
+    state = _load_equity_state()
+    start = state.get("paper_starting_equity", config.CAPITAL_USDT)
+    pnl = state.get("paper_pnl", 0.0)
+    return start + pnl
+
+
+def get_paper_effective_capital() -> float:
+    """
+    Effective capital for paper position sizing.
+    = paper_equity * CAPITAL_PCT. When there are open paper positions,
+    subtract margin in use so we don't size as if full equity is free.
+    """
+    equity = get_paper_equity()
+    capital = equity * config.CAPITAL_PCT
+    positions = _load_open_positions()
+    lev = getattr(config, "LEVERAGE", 3)
+    for pos in positions:
+        if not pos.get("paper", True):
+            continue
+        notional = pos.get("notional", 0.0)
+        if notional > 0:
+            capital -= notional / lev
+    return max(0.0, capital)
+
+
+def get_open_positions() -> list:
+    """Return list of currently open positions (for same/opposite signal checks)."""
+    return _load_open_positions()
+
+
+def _signal_side(signal: dict) -> str:
+    """Return 'BUY' or 'SELL' from signal action."""
+    action = signal.get("final_action", "")
+    return "BUY" if "BUY" in action else "SELL"
+
+
+def has_open_position_same_direction(signal: dict, positions: list) -> bool:
+    """True if any open position is in the same direction as the signal."""
+    if not positions:
+        return False
+    side = _signal_side(signal)
+    return any(side in (p.get("action") or "") for p in positions)
+
+
+def has_open_position_opposite_direction(signal: dict, positions: list) -> bool:
+    """True if any open position is in the opposite direction to the signal."""
+    if not positions:
+        return False
+    side = _signal_side(signal)
+    for p in positions:
+        pos_action = p.get("action") or ""
+        if (side == "BUY" and "SELL" in pos_action) or (side == "SELL" and "BUY" in pos_action):
+            return True
+    return False
+
+
+def close_paper_positions_at_market(close_price: float) -> list:
+    """
+    Close all paper positions at the given price (e.g. on opposite signal).
+    Updates paper_pnl and state, logs to DB, removes from open positions.
+    Returns list of closed position dicts (with result, close_price, pnl).
+    """
+    positions = _load_open_positions()
+    paper_positions = [p for p in positions if p.get("paper", True)]
+    if not paper_positions:
+        return []
+
+    closed = []
+    state = _load_equity_state()
+    # Ensure starting equity is set once
+    if "paper_starting_equity" not in state or state.get("paper_starting_equity") is None:
+        state["paper_starting_equity"] = config.CAPITAL_USDT
+
+    for pos in paper_positions:
+        pnl = _calc_paper_pnl(pos, close_price)
+        state["paper_pnl"] = state.get("paper_pnl", 0.0) + pnl
+        state["paper_trades"] = state.get("paper_trades", 0) + 1
+        if pnl > 0:
+            state["paper_wins"] = state.get("paper_wins", 0) + 1
+        else:
+            state["paper_losses"] = state.get("paper_losses", 0) + 1
+
+        entry = pos.get("entry_price", 0.0)
+        action = pos.get("action", "")
+        _ts = datetime.now(timezone.utc).isoformat()
+        _sym = pos.get("symbol", "")
+        _notes = f"Paper close — OPPOSITE_SIGNAL at {close_price:.2f}"
+        if _USE_PG:
+            pg_log_close(
+                symbol=_sym,
+                action="CLOSE_OPPOSITE",
+                entry_price=entry,
+                stop_loss=pos.get("stop_loss"),
+                target=pos.get("target"),
+                notional=pos.get("notional", 0.0),
+                close_price=close_price,
+                pnl=round(pnl, 4),
+                result="OPPOSITE_SIGNAL",
+                notes=_notes,
+                ts=_ts,
+                user_id=_USER_ID,
+            )
+        else:
+            conn = sqlite3.connect(config.DB_PATH)
+            conn.execute("""
+                INSERT INTO signals (
+                    timestamp, asset, symbol, action,
+                    entry_price, stop_loss, target, position_usdt,
+                    paper, notes, close_price, pnl, result
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                _ts, _sym.split("/")[0], _sym, "CLOSE_OPPOSITE",
+                entry, pos.get("stop_loss"), pos.get("target"), pos.get("notional"),
+                1, _notes, close_price, round(pnl, 4), "OPPOSITE_SIGNAL",
+            ))
+            conn.commit()
+            conn.close()
+
+        closed.append({**pos, "result": "OPPOSITE_SIGNAL", "close_price": close_price, "pnl": pnl})
+        logger.info(
+            f"[PAPER CLOSE] OPPOSITE_SIGNAL — {action} {_sym} | "
+            f"Entry: {entry:.2f} → Close: {close_price:.2f} | "
+            f"P&L: {'+' if pnl >= 0 else ''}{pnl:.4f} USDT"
+        )
+
+    still_open = [p for p in positions if not p.get("paper", True)]
+    _save_open_positions(still_open)
+    _save_equity_state(state)
+    return closed
 
 
 # ── Paper position P&L monitor ────────────────────────────────────────────────
@@ -863,6 +1000,28 @@ def dispatch_signal(signal: dict, current_equity: float = 0.0):
     if current_equity > 0 and check_drawdown_halt(current_equity):
         log_signal_to_db(signal, paper=True, notes="Skipped — drawdown halt active")
         return
+
+    # One position at a time: same direction → skip; opposite → close then open
+    positions = _load_open_positions()
+    if positions:
+        if has_open_position_same_direction(signal, positions):
+            logger.info(
+                f"Already have open position (same direction as {action}) — "
+                "not opening a second. Backtest-aligned: one position at a time."
+            )
+            log_signal_to_db(signal, paper=True, notes="Skipped — already have open position (same direction)")
+            return
+        if has_open_position_opposite_direction(signal, positions):
+            # Close existing position(s) first, then open new (close-then-open, not both)
+            paper_positions = [p for p in positions if p.get("paper", True)]
+            live_positions = [p for p in positions if not p.get("paper", True)]
+            if paper_positions:
+                close_paper_positions_at_market(signal["current_price"])
+            for pos in live_positions:
+                _close_live_position_at_market(pos, reason="OPPOSITE_SIGNAL")
+            # All positions now closed: paper list already updated by close_paper_positions_at_market
+            if live_positions:
+                _save_open_positions([])
 
     if config.PAPER_TRADING:
         paper_trade(signal)

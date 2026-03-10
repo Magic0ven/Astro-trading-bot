@@ -198,6 +198,48 @@ def pg_query_signals(limit: int = 200, closed_only: bool = False,
             return [dict(r) for r in cur.fetchall()]
 
 
+def pg_delete_signals_by_action(action: str, user_id: str = None) -> int:
+    """Delete all signals with the given action. Returns number of rows deleted."""
+    uid = user_id or BOT_USER_ID
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM signals WHERE user_id = %s AND action = %s",
+                (uid, action),
+            )
+            n = cur.rowcount
+        conn.commit()
+    return n
+
+
+def pg_compute_pnl_from_signals(user_id: str = None) -> dict:
+    """
+    Sum PnL from all closed trades (rows with pnl IS NOT NULL).
+    Returns dict: paper_pnl, paper_trades, paper_wins, paper_losses.
+    """
+    uid = user_id or BOT_USER_ID
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COALESCE(SUM(pnl), 0) AS total_pnl,
+                    COUNT(*) AS trades,
+                    COUNT(*) FILTER (WHERE pnl > 0) AS wins,
+                    COUNT(*) FILTER (WHERE pnl <= 0 AND pnl IS NOT NULL) AS losses
+                FROM signals
+                WHERE user_id = %s AND pnl IS NOT NULL
+            """, (uid,))
+            row = cur.fetchone()
+    if not row:
+        return {"paper_pnl": 0.0, "paper_trades": 0, "paper_wins": 0, "paper_losses": 0}
+    return {
+        "paper_pnl": float(row[0]),
+        "paper_trades": int(row[1]) or 0,
+        "paper_wins": int(row[2]) or 0,
+        "paper_losses": int(row[3]) or 0,
+    }
+
+
 # ── Open positions  (kv key: "{user_id}:open_positions") ─────────────────────
 
 def pg_load_positions(user_id: str = None) -> list:
