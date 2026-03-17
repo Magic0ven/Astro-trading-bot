@@ -212,6 +212,42 @@ def pg_delete_signals_by_action(action: str, user_id: str = None) -> int:
     return n
 
 
+def pg_query_closed_trades_with_side(user_id: str = None) -> list[dict]:
+    """
+    Return all closed trades (rows with pnl IS NOT NULL) with side inferred from
+    the preceding open: most recent row with same symbol, pnl IS NULL, action in
+    (STRONG_BUY, STRONG_SELL). Side is LONG for STRONG_BUY, SHORT for STRONG_SELL.
+    """
+    uid = user_id or BOT_USER_ID
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT
+                    c.id, c.user_id, c.timestamp, c.symbol, c.action AS close_action,
+                    c.entry_price, c.close_price, c.pnl, c.result, c.notes,
+                    o.action AS open_action
+                FROM signals c
+                LEFT JOIN LATERAL (
+                    SELECT action
+                    FROM signals o
+                    WHERE o.user_id = c.user_id
+                      AND o.symbol = c.symbol
+                      AND o.pnl IS NULL
+                      AND o.action IN ('STRONG_BUY', 'STRONG_SELL')
+                      AND o.id < c.id
+                    ORDER BY o.id DESC
+                    LIMIT 1
+                ) o ON true
+                WHERE c.user_id = %s AND c.pnl IS NOT NULL
+                ORDER BY c.id ASC
+            """, (uid,))
+            rows = [dict(r) for r in cur.fetchall()]
+    for r in rows:
+        open_act = r.get("open_action")
+        r["side"] = "LONG" if open_act == "STRONG_BUY" else ("SHORT" if open_act == "STRONG_SELL" else None)
+    return rows
+
+
 def pg_compute_pnl_from_signals(user_id: str = None) -> dict:
     """
     Sum PnL from all closed trades (rows with pnl IS NOT NULL).

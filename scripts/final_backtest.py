@@ -29,6 +29,10 @@ Usage:
     python scripts/final_backtest.py                  # default 4h cadence
     python scripts/final_backtest.py --cadence 1      # 1h candles
     python scripts/final_backtest.py --compare        # all cadences side-by-side
+    python scripts/final_backtest.py --long-short-periods   # 2022-2025 vs 2026-YTD, long vs short (shorts negative highlight)
+    python scripts/final_backtest.py --year 2026      # 2026 YTD through 17 Mar; real-world macro, SL/TP, funding, market fulfillment
+    python scripts/final_backtest.py --year 2026 --compare-nakshatra   # Nakshatra OFF vs ON, detailed long/short table (2026 YTD)
+    python scripts/final_backtest.py --compare-nakshatra               # same comparison over 2022–2025
 """
 import argparse
 import sys
@@ -63,6 +67,11 @@ EMA_FILTER    = config.EMA_FILTER          # "none" | "one_way" | "two_way"
 NK_FILTER         = config.NAKSHATRA_FILTER    # True / False
 MERCURY_RX_BLOCK  = getattr(config, "MERCURY_RX_BLOCK", True)
 SATURN_RX_BLOCK   = getattr(config, "SATURN_RX_BLOCK", True)
+# Short-block: skip SHORT when nakshatra/events historically lose (backtest 2022–2025)
+SHORT_BLOCK_NAKSHATRAS   = getattr(config, "SHORT_BLOCK_NAKSHATRAS", frozenset())
+SHORT_BLOCK_JUPITER_URANUS = getattr(config, "SHORT_BLOCK_JUPITER_URANUS", True)
+SHORT_BLOCK_NEW_MOON      = getattr(config, "SHORT_BLOCK_NEW_MOON", True)
+SHORT_BLOCK_MERCURY_RX    = getattr(config, "SHORT_BLOCK_MERCURY_RX", True)
 TAKER_FEE         = 0.0005        # 0.05% per side (Hyperliquid taker)
 SLIPPAGE      = 0.0005        # 0.05% entry slippage (market order spread)
 BLOCKED       = config.TRADE_UNFAVORABLE_NAKSHATRAS
@@ -297,6 +306,17 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             continue
         if saturn_rx_block and "BUY" in action and row.get("saturn_retrograde_active") in (True, "True", 1):
             continue
+        # Block shorts when astro conditions historically lose (align with signal_engine 7c)
+        if "SELL" in action and SHORT_BLOCK_NAKSHATRAS:
+            naks_val = (row.get("nakshatra") or "").strip() if pd.notna(row.get("nakshatra")) else ""
+            ju = row.get("jupiter_uranus_active") in (True, "True", 1)
+            nm = row.get("new_moon_active") in (True, "True", 1)
+            mr = row.get("mercury_retrograde_active") in (True, "True", 1)
+            if (naks_val in SHORT_BLOCK_NAKSHATRAS or
+                (ju and SHORT_BLOCK_JUPITER_URANUS) or
+                (nm and SHORT_BLOCK_NEW_MOON) or
+                (mr and SHORT_BLOCK_MERCURY_RX)):
+                continue
         if ot:
             continue
 
@@ -570,6 +590,297 @@ def _aggregate_yearly_results(results: dict) -> dict:
         "idle_yield_est": sum(s.get("idle_yield_est", 0) for s in results.values()),
         "cadence": c, "equity_curve": equity_curve,
     }
+
+
+def _long_short_breakdown(trade_list: list) -> dict:
+    """Split trade_list by side (BUY=long, SELL=short). Return counts, P&L, win rate per side."""
+    longs  = [t for t in trade_list if t.get("side") == "BUY"]
+    shorts = [t for t in trade_list if t.get("side") == "SELL"]
+    def _side_stats(trades):
+        if not trades:
+            return {"trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "wr": 0.0, "avg_win": 0.0, "avg_loss": 0.0}
+        wins = [t for t in trades if t["pnl"] > 0]
+        losses = [t for t in trades if t["pnl"] <= 0]
+        pnl = sum(t["pnl"] for t in trades)
+        wr = len(wins) / len(trades) * 100 if trades else 0
+        return {
+            "trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "pnl": pnl,
+            "wr": wr,
+            "avg_win": float(np.mean([t["pnl"] for t in wins])) if wins else 0.0,
+            "avg_loss": float(np.mean([t["pnl"] for t in losses])) if losses else 0.0,
+        }
+    return {
+        "long":  _side_stats(longs),
+        "short": _side_stats(shorts),
+        "long_trades": longs,
+        "short_trades": shorts,
+    }
+
+
+def print_long_short_report(period_label: str, stats: dict, cadence: int = 4):
+    """Print overall stats and long vs short breakdown; highlight when shorts are mostly negative."""
+    trade_list = stats.get("trade_list", [])
+    breakdown = _long_short_breakdown(trade_list)
+    long_s, short_s = breakdown["long"], breakdown["short"]
+
+    console.rule(f"[bold]{period_label}[/bold]")
+    # Overall
+    t = Table(
+        "Metric", "All", "Long only", "Short only",
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title=f"[bold]Long vs Short — {period_label}[/bold]",
+        show_lines=True,
+    )
+    t.add_row("Trades", str(stats.get("trades", 0)), str(long_s["trades"]), str(short_s["trades"]))
+    t.add_row("Wins", str(stats.get("wins", 0)), str(long_s["wins"]), str(short_s["wins"]))
+    t.add_row("Losses", str(stats.get("losses", 0)), str(long_s["losses"]), str(short_s["losses"]))
+    t.add_row("Win %", f"{stats.get('wr', 0):.1f}%", f"{long_s['wr']:.1f}%", f"{short_s['wr']:.1f}%")
+    total = stats.get("total", 0)
+    long_pnl_s = f"{long_s['pnl']:+,.0f}"
+    short_pnl_s = f"{short_s['pnl']:+,.0f}"
+    if long_s["pnl"] >= 0:
+        long_pnl_s = f"[green]{long_pnl_s}[/green]"
+    else:
+        long_pnl_s = f"[red]{long_pnl_s}[/red]"
+    if short_s["pnl"] >= 0:
+        short_pnl_s = f"[green]{short_pnl_s}[/green]"
+    else:
+        short_pnl_s = f"[red]{short_pnl_s}[/red]"
+    t.add_row("Total P&L ($)", f"{total:+,.0f}", long_pnl_s, short_pnl_s)
+    t.add_row("P&L %", f"{stats.get('pnl_pct', 0):.1f}%",
+              f"{(long_s['pnl']/CAPITAL*100):+.1f}%",
+              f"{(short_s['pnl']/CAPITAL*100):+.1f}%")
+    t.add_row("Max DD %", f"{stats.get('dd_pct', 0):.1f}%", "—", "—")
+    console.print(t)
+
+    short_negative = short_s["pnl"] < 0 and short_s["trades"] > 0
+    if short_negative:
+        console.print(Panel(
+            f"  [bold]Shorts are mostly negative[/bold] in this period: "
+            f"{short_s['trades']} short trades, total P&L [red]{short_s['pnl']:+,.0f}[/red] "
+            f"(win rate {short_s['wr']:.0f}%).\n"
+            f"  Longs: {long_s['trades']} trades, P&L [{'green' if long_s['pnl']>=0 else 'red'}]{long_s['pnl']:+,.0f}[/].",
+            title="[bold]Short performance[/bold]",
+            border_style="red",
+        ))
+    else:
+        console.print(Panel(
+            f"  Shorts contributed [green]{short_s['pnl']:+,.0f}[/green] in this period "
+            f"({short_s['trades']} trades, {short_s['wr']:.0f}% win rate).",
+            title="[bold]Short performance[/bold]",
+            border_style="green",
+        ))
+    console.print()
+
+
+# Astro dimensions we store per trade (for short-by-astro breakdown)
+ASTRO_DIMENSIONS = [
+    "nakshatra",
+    "full_moon_active",
+    "new_moon_active",
+    "jupiter_uranus_active",
+    "saturn_pluto_active",
+    "mercury_retrograde_active",
+    "saturn_retrograde_active",
+]
+
+
+def _short_pnl_by_astro(short_trades: list) -> dict:
+    """Group short trades by each astro dimension. Return {dim: [(value, count, pnl, wr), ...]}."""
+    if not short_trades:
+        return {}
+    out = {}
+    for dim in ASTRO_DIMENSIONS:
+        groups = {}
+        for t in short_trades:
+            raw = t.get(dim)
+            if raw is None or (isinstance(raw, float) and np.isnan(raw)):
+                val = "—"
+            elif raw in (True, "True", 1, "1"):
+                val = "Yes"
+            elif raw in (False, "False", 0, "0"):
+                val = "No"
+            else:
+                val = str(raw).strip()
+            groups.setdefault(val, []).append(t)
+        rows = []
+        for val, trades in groups.items():
+            pnl = sum(x["pnl"] for x in trades)
+            wins = sum(1 for x in trades if x["pnl"] > 0)
+            wr = wins / len(trades) * 100 if trades else 0
+            rows.append((val, len(trades), pnl, wr))
+        rows.sort(key=lambda r: r[2])  # sort by P&L ascending (most negative first)
+        out[dim] = rows
+    return out
+
+
+def _exp_for_side(s: dict) -> float:
+    """Expectancy for a side stats dict: wr/100*avg_win + (1-wr/100)*avg_loss."""
+    if s["trades"] == 0:
+        return 0.0
+    return (s["wr"] / 100 * s["avg_win"]) + ((1 - s["wr"] / 100) * s["avg_loss"])
+
+
+def print_nakshatra_comparison(stats_off: dict, stats_on: dict, label: str, cadence: int = 4):
+    """Very detailed comparison: Nakshatra filter OFF vs ON, with full long/short breakdown for both."""
+    def _break(stats):
+        b = _long_short_breakdown(stats.get("trade_list", []))
+        all_s = {
+            "trades": stats.get("trades", 0),
+            "wins": stats.get("wins", 0),
+            "losses": stats.get("losses", 0),
+            "wr": stats.get("wr", 0),
+            "pnl": stats.get("total", 0),
+            "pnl_pct": stats.get("pnl_pct", 0),
+            "avg_win": stats.get("avg_win", 0),
+            "avg_loss": stats.get("avg_loss", 0),
+            "exp": stats.get("exp", 0),
+            "end_equity": stats.get("end_equity", CAPITAL),
+            "dd_pct": stats.get("dd_pct", 0),
+        }
+        long_s = b["long"]
+        short_s = b["short"]
+        long_s["exp"] = _exp_for_side(long_s)
+        short_s["exp"] = _exp_for_side(short_s)
+        long_s["pnl_pct"] = (long_s["pnl"] / CAPITAL * 100) if CAPITAL else 0
+        short_s["pnl_pct"] = (short_s["pnl"] / CAPITAL * 100) if CAPITAL else 0
+        return all_s, long_s, short_s
+
+    off_all, off_long, off_short = _break(stats_off)
+    on_all, on_long, on_short = _break(stats_on)
+
+    console.rule(f"[bold]Nakshatra filter OFF vs ON — {label}[/bold]")
+    # Detailed table: 6 columns (OFF All, OFF Long, OFF Short | ON All, ON Long, ON Short)
+    cols = [
+        "Nakshatra OFF\n(All)",
+        "Nakshatra OFF\n(Long)",
+        "Nakshatra OFF\n(Short)",
+        "Nakshatra ON\n(All)",
+        "Nakshatra ON\n(Long)",
+        "Nakshatra ON\n(Short)",
+    ]
+    t = Table(
+        "Metric",
+        *cols,
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title="[bold]Detailed comparison — Long & Short in both modes[/bold]",
+        show_lines=True,
+    )
+    row_data = [
+        ("Trades", str(off_all["trades"]), str(off_long["trades"]), str(off_short["trades"]),
+         str(on_all["trades"]), str(on_long["trades"]), str(on_short["trades"])),
+        ("Wins", str(off_all["wins"]), str(off_long["wins"]), str(off_short["wins"]),
+         str(on_all["wins"]), str(on_long["wins"]), str(on_short["wins"])),
+        ("Losses", str(off_all["losses"]), str(off_long["losses"]), str(off_short["losses"]),
+         str(on_all["losses"]), str(on_long["losses"]), str(on_short["losses"])),
+        ("Win %", f"{off_all['wr']:.1f}%", f"{off_long['wr']:.1f}%", f"{off_short['wr']:.1f}%",
+         f"{on_all['wr']:.1f}%", f"{on_long['wr']:.1f}%", f"{on_short['wr']:.1f}%"),
+        ("Total P&L ($)",
+         f"{off_all['pnl']:+,.0f}", f"{off_long['pnl']:+,.0f}", f"{off_short['pnl']:+,.0f}",
+         f"{on_all['pnl']:+,.0f}", f"{on_long['pnl']:+,.0f}", f"{on_short['pnl']:+,.0f}"),
+        ("P&L %",
+         f"{off_all['pnl_pct']:+.1f}%", f"{off_long['pnl_pct']:+.1f}%", f"{off_short['pnl_pct']:+.1f}%",
+         f"{on_all['pnl_pct']:+.1f}%", f"{on_long['pnl_pct']:+.1f}%", f"{on_short['pnl_pct']:+.1f}%"),
+        ("Avg Win ($)",
+         f"{off_all['avg_win']:,.0f}", f"{off_long['avg_win']:,.0f}", f"{off_short['avg_win']:,.0f}",
+         f"{on_all['avg_win']:,.0f}", f"{on_long['avg_win']:,.0f}", f"{on_short['avg_win']:,.0f}"),
+        ("Avg Loss ($)",
+         f"{off_all['avg_loss']:,.0f}", f"{off_long['avg_loss']:,.0f}", f"{off_short['avg_loss']:,.0f}",
+         f"{on_all['avg_loss']:,.0f}", f"{on_long['avg_loss']:,.0f}", f"{on_short['avg_loss']:,.0f}"),
+        ("Expectancy ($)",
+         f"{off_all['exp']:+,.0f}", f"{off_long['exp']:+,.0f}", f"{off_short['exp']:+,.0f}",
+         f"{on_all['exp']:+,.0f}", f"{on_long['exp']:+,.0f}", f"{on_short['exp']:+,.0f}"),
+        ("End Equity ($)",
+         f"{off_all['end_equity']:,.0f}", "—", "—",
+         f"{on_all['end_equity']:,.0f}", "—", "—"),
+        ("Max DD %",
+         f"{off_all['dd_pct']:.1f}%", "—", "—",
+         f"{on_all['dd_pct']:.1f}%", "—", "—"),
+    ]
+    for row in row_data:
+        metric = row[0]
+        vals = [str(x) for x in row[1:]]
+        # Color P&L and Win % columns
+        if "P&L" in metric or "Expectancy" in metric or "End Equity" in metric:
+            for i, v in enumerate(vals):
+                if v in ("—", ""):
+                    continue
+                try:
+                    num = float(v.replace(",", "").replace("+", "").replace("%", "").replace("$", ""))
+                    if num < 0:
+                        vals[i] = f"[red]{v}[/red]"
+                    elif num > 0 and ("P&L" in metric or "Expectancy" in metric or "Equity" in metric):
+                        vals[i] = f"[green]{v}[/green]"
+                except ValueError:
+                    pass
+        t.add_row(metric, *vals)
+    console.print(t)
+    # Verdict panel
+    better_equity = "Nakshatra ON" if on_all["end_equity"] >= off_all["end_equity"] else "Nakshatra OFF"
+    console.print(Panel(
+        f"  [bold]Higher end equity:[/bold] [green]{better_equity}[/green]\n"
+        f"  Nakshatra OFF: {off_all['trades']} trades (Long: {off_long['trades']}, Short: {off_short['trades']})  "
+        f"P&L [{'green' if off_all['pnl']>=0 else 'red'}]{off_all['pnl']:+,.0f}[/]  DD {off_all['dd_pct']:.1f}%\n"
+        f"  Nakshatra ON:  {on_all['trades']} trades (Long: {on_long['trades']}, Short: {on_short['trades']})  "
+        f"P&L [{'green' if on_all['pnl']>=0 else 'red'}]{on_all['pnl']:+,.0f}[/]  DD {on_all['dd_pct']:.1f}%",
+        title="[bold]Verdict[/bold]",
+        border_style="green",
+    ))
+    console.print()
+
+
+def print_short_astro_report(period_label: str, trade_list: list):
+    """Break down SHORT trades by astro condition; highlight where shorts are mostly negative."""
+    shorts = [t for t in trade_list if t.get("side") == "SELL"]
+    if not shorts:
+        console.print(f"[dim]No short trades in {period_label} — skipping astro breakdown.[/dim]\n")
+        return
+    by_astro = _short_pnl_by_astro(shorts)
+    console.rule(f"[bold]Shorts by astro — {period_label}[/bold]")
+    negative_conditions = []
+    for dim in ASTRO_DIMENSIONS:
+        rows = by_astro.get(dim, [])
+        if not rows:
+            continue
+        dim_label = dim.replace("_", " ").title()
+        t = Table(
+            dim_label, "Trades", "Short P&L ($)", "Win %",
+            box=box.SIMPLE,
+            header_style="bold",
+            title=f"[bold]{dim_label}[/bold]",
+        )
+        for val, count, pnl, wr in rows:
+            pnl_str = f"{pnl:+,.0f}"
+            if pnl < 0:
+                pnl_str = f"[red]{pnl_str}[/red]"
+                negative_conditions.append((dim, val, count, pnl, wr))
+            else:
+                pnl_str = f"[green]{pnl_str}[/green]"
+            t.add_row(str(val), str(count), pnl_str, f"{wr:.0f}%")
+        console.print(t)
+        console.print()
+    if negative_conditions:
+        console.print(Panel(
+            "\n".join(
+                f"  • [bold]{d}[/bold] = [red]{v}[/red]: {c} shorts, P&L [red]{p:+,.0f}[/red] ({wr:.0f}% WR)"
+                for d, v, c, p, wr in negative_conditions[:15]
+            )
+            + ("\n  …" if len(negative_conditions) > 15 else ""),
+            title="[bold]Astro conditions where shorts are negative[/bold]",
+            border_style="red",
+        ))
+    else:
+        console.print(Panel(
+            "  No astro bucket has negative short P&L in this period.",
+            title="[bold]Shorts by astro[/bold]",
+            border_style="green",
+        ))
+    console.print()
 
 
 def _run_year(path, funding, cadence):
@@ -1114,7 +1425,82 @@ def main():
                         help="Run with and without early book-profit and print side-by-side (uses --book-profit value).")
     parser.add_argument("--compare-overlay", action="store_true",
                         help="Compare with vs without decisive overlay (best-call rules). Needs CSVs with action_no_overlay column (re-run backtest.py).")
+    parser.add_argument("--long-short-periods", action="store_true",
+                        help="Run backtest for 2022-2025 and 2026-YTD separately; report long vs short breakdown (highlight when shorts are mostly negative).")
+    parser.add_argument("--year", type=int, default=None, metavar="YYYY",
+                        help="Run real-world backtest for a single year (e.g. 2026). Uses logs/backtest_BTC_YYYY*.csv.")
+    parser.add_argument("--end", type=str, default=None, metavar="YYYY-MM-DD",
+                        help="End date for --year (inclusive). Default for 2026: 2026-03-17 (YTD through 17 Mar). Real-world: macro, SL/TP, funding, market fulfillment.")
+    parser.add_argument("--compare-nakshatra", action="store_true",
+                        help="Run backtest with Nakshatra filter OFF and ON; print detailed long/short comparison table for both.")
     args = parser.parse_args()
+
+    # ── Real-world single-year backtest (e.g. 2026 YTD through 17 Mar) ─────────
+    if args.year is not None:
+        log_dir = Path("logs")
+        paths = sorted(log_dir.glob(f"backtest_BTC_{args.year}*.csv"))
+        if not paths:
+            console.print(f"[red]No backtest CSV found for {args.year}. Add logs/backtest_BTC_{args.year}-01-01_*.csv (e.g. from scripts/backtest.py).[/red]")
+            sys.exit(1)
+        fpath = paths[-1]
+        df = pd.read_csv(fpath)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        # YTD cap: default 2026 to 17 March 2026 only
+        end_date_str = args.end
+        if end_date_str is None and args.year == 2026:
+            end_date_str = "2026-03-17"
+        if end_date_str:
+            end_date_only = pd.Timestamp(end_date_str).date()
+            df = df[df["timestamp"].dt.date <= end_date_only]
+            if df.empty:
+                console.print(f"[red]No data on or before {end_date_str}. Check CSV date range.[/red]")
+                sys.exit(1)
+        start_d = str(df["timestamp"].min().date())
+        end_d = str(df["timestamp"].max().date())
+        label = args.label or f"{args.year} YTD ({start_d} → {end_d})"
+        cadence = args.cadence
+        book_r = max(0.0, float(args.book_profit))
+        # Funding for this period
+        fcsv = Path(f"logs/funding_BTCUSDT_{start_d}_{end_d}.csv")
+        if not fcsv.exists():
+            fcsv = Path(f"logs/funding_BTCUSDT_{args.year}-01-01_{args.year}-12-31.csv")
+        if fcsv.exists():
+            fund_df = pd.read_csv(fcsv)
+            fund_df["timestamp"] = pd.to_datetime(fund_df["timestamp"], utc=True, format="mixed")
+            funding = fund_df.set_index("timestamp")["funding_rate"]
+        else:
+            funding = pd.Series(dtype=float)
+            console.print(f"[dim]No funding CSV for {args.year} — funding impact skipped.[/dim]")
+        console.print()
+        console.print(Panel.fit(
+            f"[bold cyan]Real-world {args.year} YTD backtest[/bold cyan]\n"
+            f"[dim]Macro (EMA)  |  Intrabar SL/TP  |  Funding cost  |  Market fulfillment (slippage 0.05%, fee 0.05%/side)  |  Short-block  |  {cadence}h[/dim]\n"
+            f"[dim]{start_d} → {end_d}  ({fpath.name})[/dim]",
+            border_style="cyan",
+        ))
+        if args.compare_nakshatra:
+            stats_off = simulate(df, funding, cadence=cadence,
+                                 use_intrabar=True, use_fees=True,
+                                 use_slippage=True, use_funding=True,
+                                 rr_ratio=args.rr, book_profit_at_r=book_r,
+                                 nk_filter=False)
+            stats_on = simulate(df, funding, cadence=cadence,
+                                use_intrabar=True, use_fees=True,
+                                use_slippage=True, use_funding=True,
+                                rr_ratio=args.rr, book_profit_at_r=book_r,
+                                nk_filter=True)
+            console.print()
+            print_nakshatra_comparison(stats_off, stats_on, label, cadence)
+            return
+        stats = simulate(df, funding, cadence=cadence,
+                         use_intrabar=True, use_fees=True,
+                         use_slippage=True, use_funding=True,
+                         rr_ratio=args.rr, book_profit_at_r=book_r)
+        console.print()
+        print_single_period(stats, label, cadence, start_d, end_d)
+        print_long_short_report(label, stats, cadence)
+        print_short_astro_report(label, stats.get("trade_list", []))
+        return
 
     # ── Single-file mode (partial year / custom period) ────────────────────────
     if args.file:
@@ -1239,6 +1625,80 @@ def main():
         df = pd.read_csv(path)
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         raw_dfs[y] = df
+
+    # ── Nakshatra OFF vs ON — detailed long/short comparison ───────────────────
+    if args.compare_nakshatra and raw_dfs:
+        cadence = args.cadence
+        funding = load_funding_rates()
+        book_r = max(0.0, float(args.book_profit))
+        all_off = {}
+        all_on = {}
+        for y, df in raw_dfs.items():
+            console.print(f"[dim]Comparing Nakshatra for {y} @ {cadence}h...[/dim]", end="\r")
+            all_off[y] = simulate(df, funding, cadence=cadence,
+                                  use_intrabar=True, use_fees=True,
+                                  use_slippage=True, use_funding=True,
+                                  rr_ratio=args.rr, book_profit_at_r=book_r,
+                                  nk_filter=False)
+            all_on[y] = simulate(df, funding, cadence=cadence,
+                                 use_intrabar=True, use_fees=True,
+                                 use_slippage=True, use_funding=True,
+                                 rr_ratio=args.rr, book_profit_at_r=book_r,
+                                 nk_filter=True)
+        console.print(" " * 50, end="\r")
+        agg_off = _aggregate_yearly_results(all_off)
+        agg_on = _aggregate_yearly_results(all_on)
+        console.rule("[bold]Nakshatra filter OFF vs ON — 2022–2025 (4-year)[/bold]")
+        print_nakshatra_comparison(agg_off, agg_on, "2022–2025 (4-year)", cadence)
+        return
+
+    # ── Long vs short by period: 2022-2025 vs 2026-YTD ────────────────────────
+    if args.long_short_periods:
+        cadence = args.cadence
+        funding = load_funding_rates()
+        book_r = max(0.0, float(args.book_profit))
+
+        # 2022-2025
+        if raw_dfs:
+            console.print("[dim]Simulating 2022-2025...[/dim]")
+            all_2022_2025 = {}
+            for y, df in raw_dfs.items():
+                all_2022_2025[y] = simulate(df, funding, cadence=cadence,
+                                            use_intrabar=True, use_fees=True,
+                                            use_slippage=True, use_funding=True,
+                                            rr_ratio=args.rr, book_profit_at_r=book_r)
+            agg_2022_2025 = _aggregate_yearly_results(all_2022_2025)
+            print_long_short_report("2022–2025 (4-year)", agg_2022_2025, cadence)
+            print_short_astro_report("2022–2025 (4-year)", agg_2022_2025.get("trade_list", []))
+        else:
+            console.print("[yellow]No 2022-2025 data (missing logs/backtest_BTC_YYYY-01-01_YYYY-12-31.csv).[/yellow]")
+
+        # 2026-YTD: look for any backtest CSV that starts in 2026
+        log_dir = Path("logs")
+        ytd_2026_paths = sorted(log_dir.glob("backtest_BTC_2026*.csv"))
+        if ytd_2026_paths:
+            # Use the file that covers 2026-01-01 to latest (often one file)
+            path_2026 = ytd_2026_paths[-1]
+            df_2026 = pd.read_csv(path_2026)
+            df_2026["timestamp"] = pd.to_datetime(df_2026["timestamp"], utc=True)
+            start_d = str(df_2026["timestamp"].min().date())
+            end_d = str(df_2026["timestamp"].max().date())
+            console.print(f"[dim]Simulating 2026-YTD ({path_2026.name})...[/dim]")
+            funding_2026 = load_funding_rates()
+            stats_2026 = simulate(df_2026, funding_2026, cadence=cadence,
+                                 use_intrabar=True, use_fees=True,
+                                 use_slippage=True, use_funding=True,
+                                 rr_ratio=args.rr, book_profit_at_r=book_r)
+            print_long_short_report(f"2026-YTD ({start_d} → {end_d})", stats_2026, cadence)
+            print_short_astro_report(f"2026-YTD ({start_d} → {end_d})", stats_2026.get("trade_list", []))
+        else:
+            console.print(Panel(
+                "[yellow]No 2026-YTD data.[/yellow]\n"
+                "Add logs/backtest_BTC_2026-01-01_2026-MM-DD.csv (or similar) and re-run with --long-short-periods.",
+                title="[bold]2026-YTD[/bold]",
+                border_style="yellow",
+            ))
+        return
 
     # ── Compare with vs without decisive overlay ───────────────────────────────
     if args.compare_overlay and raw_dfs:

@@ -129,6 +129,17 @@ def nakshatra_multiplier(moon_longitude_sidereal: float) -> float:
 EMA_FILTER   = os.getenv("EMA_FILTER", "two_way")   # none | one_way | two_way
 EMA_PERIOD   = int(os.getenv("EMA_PERIOD", "20"))
 
+# ── Short-block filter (from backtest: astro conditions where shorts lose) ──────
+# When any of these are true, SELL signals are turned to NO_TRADE to avoid losing shorts.
+# Derived from scripts/final_backtest.py --long-short-periods (2022–2025).
+SHORT_BLOCK_NAKSHATRAS = frozenset({
+    "Shravana", "Anuradha", "Magha", "Rohini", "Vishakha", "Pushya", "Mula",
+    "Jyeshtha", "Swati", "Purva Bhadrapada", "Chitra", "Ashlesha", "Revati", "Ashwini",
+})
+SHORT_BLOCK_JUPITER_URANUS = os.getenv("SHORT_BLOCK_JUPITER_URANUS", "true").lower() == "true"
+SHORT_BLOCK_NEW_MOON      = os.getenv("SHORT_BLOCK_NEW_MOON", "true").lower() == "true"
+SHORT_BLOCK_MERCURY_RX    = os.getenv("SHORT_BLOCK_MERCURY_RX", "true").lower() == "true"
+
 # ── Signal Thresholds ─────────────────────────────────────────────────────────
 SLOPE_THRESHOLD = float(os.getenv("SLOPE_THRESHOLD", "0.5"))
 SCORE_HISTORY_WINDOW = int(os.getenv("SCORE_HISTORY_WINDOW", "5"))

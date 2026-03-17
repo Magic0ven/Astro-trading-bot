@@ -310,6 +310,27 @@ def generate_signal(
             filter_reason = f"EMA_FILTER:price({current_price:.2f})<EMA({ema:.2f})_blocked_BUY"
             final_action = "NO_TRADE"
 
+    # 7c. Short-block filter — skip SHORT when astro conditions historically lose (backtest 2022–2025)
+    if (
+        filter_reason is None
+        and "SELL" in (final_action or "")
+        and getattr(config, "SHORT_BLOCK_NAKSHATRAS", None)
+    ):
+        nk = sky.get("nakshatra", "")
+        astro = sky.get("astro_events") or {}
+        block_reasons = []
+        if nk in config.SHORT_BLOCK_NAKSHATRAS:
+            block_reasons.append(f"nakshatra={nk}")
+        if getattr(config, "SHORT_BLOCK_JUPITER_URANUS", True) and astro.get("jupiter_uranus_active"):
+            block_reasons.append("Jupiter–Uranus")
+        if getattr(config, "SHORT_BLOCK_NEW_MOON", True) and astro.get("new_moon_active"):
+            block_reasons.append("new_moon")
+        if getattr(config, "SHORT_BLOCK_MERCURY_RX", True) and astro.get("mercury_retrograde_active"):
+            block_reasons.append("Mercury_RX")
+        if block_reasons:
+            filter_reason = "SHORT_BLOCK:" + ",".join(block_reasons)
+            final_action = "NO_TRADE"
+
     if filter_reason:
         logger.info(f"Signal filtered — {filter_reason}")
 
