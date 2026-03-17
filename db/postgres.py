@@ -276,6 +276,44 @@ def pg_compute_pnl_from_signals(user_id: str = None) -> dict:
     }
 
 
+def pg_get_stats(user_id: str = None) -> dict:
+    """
+    Return dashboard stats for a user: trades, wins, losses, win_rate, total_pnl,
+    avg_win, avg_loss. Used by GET /api/users/{uid}/stats.
+    """
+    uid = user_id or BOT_USER_ID
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS trades,
+                    COUNT(*) FILTER (WHERE pnl > 0) AS wins,
+                    COUNT(*) FILTER (WHERE pnl <= 0 AND pnl IS NOT NULL) AS losses,
+                    COALESCE(SUM(pnl), 0) AS total_pnl,
+                    COALESCE(AVG(pnl) FILTER (WHERE pnl > 0), 0) AS avg_win,
+                    COALESCE(AVG(pnl) FILTER (WHERE pnl <= 0 AND pnl IS NOT NULL), 0) AS avg_loss
+                FROM signals
+                WHERE user_id = %s AND pnl IS NOT NULL
+            """, (uid,))
+            row = cur.fetchone()
+    if not row or row[0] == 0:
+        return {
+            "trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
+            "total_pnl": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
+        }
+    trades, wins, losses, total_pnl, avg_win, avg_loss = row
+    win_rate = round(wins / trades * 100, 1) if trades else 0.0
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "total_pnl": float(total_pnl),
+        "avg_win": float(avg_win),
+        "avg_loss": float(avg_loss),
+    }
+
+
 # ── Open positions  (kv key: "{user_id}:open_positions") ─────────────────────
 
 def pg_load_positions(user_id: str = None) -> list:
