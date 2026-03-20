@@ -178,6 +178,88 @@ MAX_OPEN_BARS         = int(os.getenv("MAX_OPEN_BARS", "12"))
 RR_RATIO              = float(os.getenv("RR_RATIO", "2.0"))
 ATR_MULTIPLIER        = float(os.getenv("ATR_MULTIPLIER", "1.5"))
 
+# ── Position sizing overlays (dayboost + seasonality) ──────────────────────────
+# These scale *risk per trade* (and therefore notional size) without changing the
+# astro-derived direction. Multipliers are applied only when opening a new trade.
+#
+# Default "combined" profile (matches the recent backtest overlays):
+# - Dayboost (all trades): 1,3,30,31 boosted; 5-7 moderate boost
+# - Seasonality:
+#   - BUY-only day 15 boosted ("monthly lows" window)
+#   - SELL-only days 1/30/31 boosted ("monthly highs" window)
+#   - BUY-only Sundays boosted
+#   - All-sides Mondays slightly boosted
+#
+# Format:
+#   DAY_MULTIPLIERS="1=1.5,3=1.5,5=1.25,..."
+#   BUY_DAY_MULTIPLIERS="15=1.25"
+#   SELL_DAY_MULTIPLIERS="1=1.25,30=1.25,31=1.25"
+#   WEEKDAY_MULTIPLIERS="mon=1.05"
+#   BUY_WEEKDAY_MULTIPLIERS="sun=1.2"
+
+def _parse_int_float_map(spec: str) -> dict:
+    out = {}
+    if not spec:
+        return out
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k_s, v_s = tok.split("=", 1)
+        try:
+            k = int(k_s.strip())
+            v = float(v_s.strip())
+        except Exception:
+            continue
+        if k <= 0 or v <= 0:
+            continue
+        out[k] = v
+    return out
+
+
+def _parse_weekday_map(spec: str) -> dict:
+    name_to_idx = {
+        "mon": 0, "monday": 0,
+        "tue": 1, "tues": 1, "tuesday": 1,
+        "wed": 2, "weds": 2, "wednesday": 2,
+        "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+        "fri": 4, "friday": 4,
+        "sat": 5, "saturday": 5,
+        "sun": 6, "sunday": 6,
+    }
+    out = {}
+    if not spec:
+        return out
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k_s, v_s = tok.split("=", 1)
+        k = name_to_idx.get(k_s.strip().lower())
+        if k is None:
+            continue
+        try:
+            v = float(v_s.strip())
+        except Exception:
+            continue
+        if v <= 0:
+            continue
+        out[int(k)] = v
+    return out
+
+
+SIZE_OVERLAY_ENABLED = os.getenv("SIZE_OVERLAY_ENABLED", "true").lower() == "true"
+
+DAY_MULTIPLIERS = _parse_int_float_map(os.getenv(
+    "DAY_MULTIPLIERS",
+    "1=1.5,3=1.5,5=1.25,6=1.25,7=1.25,30=1.5,31=1.5",
+))
+BUY_DAY_MULTIPLIERS = _parse_int_float_map(os.getenv("BUY_DAY_MULTIPLIERS", "15=1.25"))
+SELL_DAY_MULTIPLIERS = _parse_int_float_map(os.getenv("SELL_DAY_MULTIPLIERS", "1=1.25,30=1.25,31=1.25"))
+
+WEEKDAY_MULTIPLIERS = _parse_weekday_map(os.getenv("WEEKDAY_MULTIPLIERS", "mon=1.05"))
+BUY_WEEKDAY_MULTIPLIERS = _parse_weekday_map(os.getenv("BUY_WEEKDAY_MULTIPLIERS", "sun=1.2"))
+
 # ── Position monitor (book profit early) ───────────────────────────────────────
 # How often to check open positions for "book profit" (minutes). 0 = disabled.
 # When > 0, a separate loop runs every N minutes and closes any position whose

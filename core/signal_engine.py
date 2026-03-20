@@ -122,6 +122,7 @@ def calculate_position_size(
     num_multiplier: float,
     signal_strength: str,
     capital: float = 0.0,
+    now: Optional[datetime] = None,
 ) -> float:
     """
     Returns position size in USDT notional value.
@@ -133,8 +134,30 @@ def calculate_position_size(
     capital: live effective capital (account_balance * CAPITAL_PCT).
              Falls back to config.CAPITAL_USDT if not provided.
     """
+    if now is None:
+        now = datetime.now(timezone.utc)
     effective = capital if capital > 0 else config.CAPITAL_USDT
-    risk_amount = effective * config.RISK_PER_TRADE_PCT
+    # Optional sizing overlay (dayboost + seasonality)
+    mult = 1.0
+    if getattr(config, "SIZE_OVERLAY_ENABLED", False):
+        dom = int(now.day)
+        dow = int(now.weekday())  # Mon=0 ... Sun=6
+        base_dom = float(getattr(config, "DAY_MULTIPLIERS", {}).get(dom, 1.0))
+        base_dow = float(getattr(config, "WEEKDAY_MULTIPLIERS", {}).get(dow, 1.0))
+        if "BUY" in (signal_strength or ""):
+            side_dom = float(getattr(config, "BUY_DAY_MULTIPLIERS", {}).get(dom, 1.0))
+            side_dow = float(getattr(config, "BUY_WEEKDAY_MULTIPLIERS", {}).get(dow, 1.0))
+        elif "SELL" in (signal_strength or ""):
+            side_dom = float(getattr(config, "SELL_DAY_MULTIPLIERS", {}).get(dom, 1.0))
+            side_dow = 1.0
+        else:
+            side_dom = 1.0
+            side_dow = 1.0
+        mult = base_dom * base_dow * side_dom * side_dow
+        if mult <= 0:
+            mult = 1.0
+
+    risk_amount = effective * config.RISK_PER_TRADE_PCT * mult
     distance = abs(entry_price - stop_loss_price)
     if distance == 0:
         return 0.0
@@ -348,6 +371,7 @@ def generate_signal(
         num_multiplier=num_mult,
         signal_strength=final_action,
         capital=effective_capital,
+        now=now,
     )
 
     signal = {
@@ -359,6 +383,7 @@ def generate_signal(
         "filter_reason": filter_reason,
         "ema_value": round(current_ema, 2) if current_ema else None,
         "effective_capital": round(effective_capital, 2),
+        "size_overlay_enabled": bool(getattr(config, "SIZE_OVERLAY_ENABLED", False)),
         "western_signal": western_signal,
         "vedic_signal": vedic_signal,
         "western_score": round(western_score_adj, 4),

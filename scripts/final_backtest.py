@@ -33,8 +33,11 @@ Usage:
     python scripts/final_backtest.py --year 2026      # 2026 YTD through 17 Mar; real-world macro, SL/TP, funding, market fulfillment
     python scripts/final_backtest.py --year 2026 --compare-nakshatra   # Nakshatra OFF vs ON, detailed long/short table (2026 YTD)
     python scripts/final_backtest.py --compare-nakshatra               # same comparison over 2022–2025
+    python scripts/final_backtest.py --cadence-min 15 --long-short-periods   # 15m cadence, 2022–2025 + 2026 YTD (requires *_15m.csv from backtest.py --interval-min 15)
+    python scripts/final_backtest.py --compare-intrahour --log logs/cadence_comparison_15m_30m_1h.txt   # 15m vs 30m vs 1h, output to log file
 """
 import argparse
+import atexit
 import sys
 from pathlib import Path
 
@@ -90,15 +93,23 @@ def _atr(p):  return p.pct_change().abs().rolling(ATR_LOOKBACK).mean() * p
 def _ema(p):  return p.ewm(span=EMA_PERIOD, adjust=False).mean()
 
 
-def resample_to_nh(df: pd.DataFrame, hours: int) -> pd.DataFrame:
+def cadence_label(cadence) -> str:
+    """Display string for cadence (hours or minutes). cadence in hours (e.g. 0.25 = 15m, 0.5 = 30m)."""
+    if isinstance(cadence, (int, float)) and cadence < 1 and cadence > 0:
+        return f"{int(round(cadence * 60))}m"
+    return f"{int(cadence)}h"
+
+
+def resample_to_nh(df: pd.DataFrame, hours) -> pd.DataFrame:
     """
     Aggregate a 1h-resolution DataFrame into N-hour OHLC candles.
+    When hours < 1 (e.g. 0.25 for 15m), no resampling — data is already at that resolution.
 
     OHLC: open=first, high=MAX, low=MIN, close=last  (captures every wick)
     Signals: taken from the FIRST row of each window  (what the bot sees
              when it wakes up at the start of the N-hour period)
     """
-    if hours == 1:
+    if hours == 1 or (isinstance(hours, (int, float)) and hours < 1):
         return df.copy()
 
     df = df.copy()
@@ -114,7 +125,7 @@ def resample_to_nh(df: pd.DataFrame, hours: int) -> pd.DataFrame:
                     "moon_phase_deg"]
                    if c in df.columns]
 
-    freq = f"{hours}h"
+    freq = f"{int(hours)}h" if hours >= 1 else f"{int(hours * 60)}min"
 
     price_agg = df[["open", "high", "low", "price"]].resample(freq).agg(
         open=("open",  "first"),
@@ -137,8 +148,66 @@ def load_funding_rates() -> pd.Series:
     return df.set_index("timestamp")["funding_rate"]
 
 
+def parse_int_float_map(spec: str) -> dict:
+    """
+    Parse "k=v,k=v" into {int(k): float(v)}. Ignores invalid tokens.
+    Example: "1=1.5,3=1.5,5=1.25" -> {1: 1.5, 3: 1.5, 5: 1.25}
+    """
+    out = {}
+    if not spec:
+        return out
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k_s, v_s = tok.split("=", 1)
+        try:
+            k = int(k_s.strip())
+            v = float(v_s.strip())
+        except Exception:
+            continue
+        if k <= 0 or v <= 0:
+            continue
+        out[k] = v
+    return out
+
+
+def parse_weekday_map(spec: str) -> dict:
+    """
+    Parse "mon=1.1,sun=1.2" into {0:1.1, 6:1.2} where Monday=0 ... Sunday=6.
+    """
+    if not spec:
+        return {}
+    name_to_idx = {
+        "mon": 0, "monday": 0,
+        "tue": 1, "tues": 1, "tuesday": 1,
+        "wed": 2, "weds": 2, "wednesday": 2,
+        "thu": 3, "thur": 3, "thurs": 3, "thursday": 3,
+        "fri": 4, "friday": 4,
+        "sat": 5, "saturday": 5,
+        "sun": 6, "sunday": 6,
+    }
+    out = {}
+    for tok in str(spec).split(","):
+        tok = tok.strip()
+        if not tok or "=" not in tok:
+            continue
+        k_s, v_s = tok.split("=", 1)
+        k = name_to_idx.get(k_s.strip().lower())
+        if k is None:
+            continue
+        try:
+            v = float(v_s.strip())
+        except Exception:
+            continue
+        if v <= 0:
+            continue
+        out[int(k)] = v
+    return out
+
+
 def simulate(df: pd.DataFrame, funding: pd.Series,
-             cadence: int = INTERVAL,
+             cadence = INTERVAL,
              use_intrabar: bool = True,
              use_fees: bool = True,
              use_slippage: bool = True,
@@ -151,15 +220,33 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
              risk_pct: float = RISK_PCT,
              starting_capital: float = CAPITAL,
              rr_ratio: float = None,
-             book_profit_at_r: float = 0) -> dict:
-    """book_profit_at_r: if > 0, close trade when unrealized PnL >= this many R (early book profit). 0 = off (earlier logic)."""
+             book_profit_at_r: float = 0,
+             allowed_entry_days: set = None,
+             day_risk_mult: dict = None,
+             weekday_risk_mult: dict = None,
+             buy_day_risk_mult: dict = None,
+             sell_day_risk_mult: dict = None,
+             buy_weekday_risk_mult: dict = None,
+             sell_weekday_risk_mult: dict = None) -> dict:
+    """
+    allowed_entry_days: if provided, only open new trades on candles whose
+    calendar day-of-month is in this set (e.g. {1, 3, 7, 9}).
+    Open trades are always allowed to continue / exit on any day.
+    book_profit_at_r: if > 0, close trade when unrealized PnL >= this many R.
+    """
     if rr_ratio is None:
         rr_ratio = RR_RATIO
+    day_risk_mult = day_risk_mult or {}
+    weekday_risk_mult = weekday_risk_mult or {}
+    buy_day_risk_mult = buy_day_risk_mult or {}
+    sell_day_risk_mult = sell_day_risk_mult or {}
+    buy_weekday_risk_mult = buy_weekday_risk_mult or {}
+    sell_weekday_risk_mult = sell_weekday_risk_mult or {}
 
     # Resample to the requested cadence so ATR and intrabar highs/lows
-    # reflect N-hour candles, not 1h candles.
+    # reflect N-hour candles, not 1h candles. (cadence can be float for 15m = 0.25)
     df     = resample_to_nh(df, cadence)
-    max_open_bars = max(1, 48 // cadence)   # always ~48h max hold
+    max_open_bars = max(1, int(48 / cadence))   # always ~48h max hold
 
     prices = df["price"]
     at     = _atr(prices)
@@ -299,6 +386,10 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
         # ── Signal filters ─────────────────────────────────────────────────
         if action not in ("STRONG_BUY", "STRONG_SELL"):
             continue
+
+        # Day-of-month filter: only enter on allowed calendar days
+        if allowed_entry_days and ts.day not in allowed_entry_days:
+            continue
         if nk_filter and naks in BLOCKED:
             continue
         # Block longs only during Mercury/Saturn RX (shorts allowed)
@@ -333,7 +424,22 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             at_v = close * 0.015
 
         side = "BUY" if "BUY" in action else "SELL"
-        risk = equity * risk_pct
+        dom = int(ts.day)
+        dow = int(ts.dayofweek)  # Mon=0 ... Sun=6
+
+        base_dom_mult = float(day_risk_mult.get(dom, 1.0)) if day_risk_mult else 1.0
+        base_dow_mult = float(weekday_risk_mult.get(dow, 1.0)) if weekday_risk_mult else 1.0
+
+        side_dom_mult = float((buy_day_risk_mult if side == "BUY" else sell_day_risk_mult).get(dom, 1.0))
+        side_dow_mult = float((buy_weekday_risk_mult if side == "BUY" else sell_weekday_risk_mult).get(dow, 1.0))
+
+        dom_mult = base_dom_mult * side_dom_mult
+        dow_mult = base_dow_mult * side_dow_mult
+        mult = dom_mult * dow_mult
+        if mult <= 0:
+            mult = 1.0
+
+        risk = equity * risk_pct * mult
         sld  = at_v * ATR_MULT
 
         # Entry price: next open + slippage
@@ -356,6 +462,7 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             "side": side, "signal": action, "entry": entry, "sl": sl, "tp": tp,
             "risk": risk, "notional": notional,
             "age": 0, "month": month, "open_ts": str(ts)[:16],
+            "day_risk_mult": mult,
         }
         for k in ("nakshatra", "resonance_day", "western_score", "vedic_score",
                   "western_slope", "vedic_slope", "full_moon_active", "new_moon_active",
@@ -533,6 +640,116 @@ def compounded_growth(results: dict) -> tuple:
     return cagr, compound
 
 
+def print_intrahour_comparison(agg_2022_2025: dict, stats_2026: dict, cadence_configs: list):
+    """Print comparison table for 15m, 30m, 1h (cadence_configs = [(0.25,'15m'), (0.5,'30m'), (1,'1h')])."""
+    t = Table(
+        "Cadence", "Period", "Trades", "Win %", "P&L %", "Max DD %", "End Equity",
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title="[bold]15m vs 30m vs 1h — Comparison[/bold]",
+        show_lines=True,
+    )
+    for c, label in cadence_configs:
+        a = agg_2022_2025.get(c)
+        s6 = stats_2026.get(c)
+        if a:
+            pc = "green" if a.get("pnl_pct", 0) >= 0 else "red"
+            t.add_row(
+                cadence_label(c), "2022–2025",
+                str(a.get("trades", 0)), f"{a.get('wr', 0):.1f}%",
+                f"[{pc}]{a.get('pnl_pct', 0):+.1f}%[/{pc}]",
+                f"{a.get('dd_pct', 0):.1f}%",
+                f"${a.get('end_equity', CAPITAL):,.0f}",
+            )
+        else:
+            t.add_row(cadence_label(c), "2022–2025", "—", "—", "—", "—", "—")
+        if s6:
+            pc = "green" if s6.get("pnl_pct", 0) >= 0 else "red"
+            t.add_row(
+                cadence_label(c), "2026 YTD",
+                str(s6.get("trades", 0)), f"{s6.get('wr', 0):.1f}%",
+                f"[{pc}]{s6.get('pnl_pct', 0):+.1f}%[/{pc}]",
+                f"{s6.get('dd_pct', 0):.1f}%",
+                f"${s6.get('end_equity', CAPITAL):,.0f}",
+            )
+        else:
+            t.add_row(cadence_label(c), "2026 YTD", "—", "—", "—", "—", "—")
+    console.print(t)
+
+
+def print_overlay_suite_table(results_by_scenario: dict, cadence_configs: list):
+    """
+    results_by_scenario = {
+      "base": {"2022_2025": {cad: agg}, "2026": {cad: stats_or_none}},
+      "dayboost": {...}, "seasonality": {...}, "combined": {...}
+    }
+    """
+    scenarios = list(results_by_scenario.keys())
+    t = Table(
+        "Cadence", "Period",
+        *[f"{s} P&L%" for s in scenarios],
+        *[f"{s} DD%" for s in scenarios],
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title="[bold]Overlay suite — base vs dayboost vs seasonality vs combined[/bold]",
+        show_lines=True,
+    )
+
+    def _cell_pnl(v):
+        if v is None:
+            return "—"
+        pc = "green" if v >= 0 else "red"
+        return f"[{pc}]{v:+.1f}%[/{pc}]"
+
+    def _cell_dd(v):
+        if v is None:
+            return "—"
+        return f"{v:.1f}%"
+
+    for c, _label in cadence_configs:
+        for period in ("2022–2025", "2026 YTD"):
+            pnl_row = []
+            dd_row = []
+            for s in scenarios:
+                pack = results_by_scenario[s]
+                stats = (pack["2022_2025"].get(c) if period == "2022–2025" else pack["2026"].get(c))
+                pnl_row.append(_cell_pnl(stats.get("pnl_pct") if stats else None))
+                dd_row.append(_cell_dd(stats.get("dd_pct") if stats else None))
+            t.add_row(cadence_label(c), period, *pnl_row, *dd_row)
+    console.print(t)
+
+    # Delta vs base table
+    if "base" in results_by_scenario:
+        dt = Table(
+            "Cadence", "Period",
+            *[f"{s} ΔP&L%" for s in scenarios if s != "base"],
+            box=box.MINIMAL_HEAVY_HEAD,
+            header_style="bold white on dark_blue",
+            title="[bold]Overlay suite — delta vs base[/bold]",
+            show_lines=True,
+        )
+        for c, _label in cadence_configs:
+            for period in ("2022–2025", "2026 YTD"):
+                base_stats = (results_by_scenario["base"]["2022_2025"].get(c)
+                              if period == "2022–2025" else results_by_scenario["base"]["2026"].get(c))
+                base_pnl = base_stats.get("pnl_pct") if base_stats else None
+                deltas = []
+                for s in scenarios:
+                    if s == "base":
+                        continue
+                    stats = (results_by_scenario[s]["2022_2025"].get(c)
+                             if period == "2022–2025" else results_by_scenario[s]["2026"].get(c))
+                    pnl = stats.get("pnl_pct") if stats else None
+                    if base_pnl is None or pnl is None:
+                        deltas.append("—")
+                        continue
+                    d = pnl - base_pnl
+                    dc = "green" if d >= 0 else "red"
+                    deltas.append(f"[{dc}]{d:+.1f}%[/{dc}]")
+                dt.add_row(cadence_label(c), period, *deltas)
+        console.print(dt)
+
+
 def _aggregate_yearly_results(results: dict) -> dict:
     """Merge per-year stats {year: stats} into one aggregate stats dict."""
     if not results:
@@ -590,6 +807,54 @@ def _aggregate_yearly_results(results: dict) -> dict:
         "idle_yield_est": sum(s.get("idle_yield_est", 0) for s in results.values()),
         "cadence": c, "equity_curve": equity_curve,
     }
+
+
+def print_monthly_days_report(stats_all: dict, stats_days: dict,
+                               day_set: set, period_label: str, cadence: int):
+    """
+    Side-by-side: all-days (normal) vs restricted to specific calendar days.
+    Shows overall stats + long/short breakdown for both.
+    """
+    days_label = ", ".join(str(d) for d in sorted(day_set))
+    a, d = stats_all, stats_days
+
+    def _row(label, key, fmt="{}", higher_better=True):
+        va = a.get(key, 0)
+        vd = d.get(key, 0)
+        diff = vd - va
+        if key == "dd_pct":
+            diff = -diff  # lower DD is better
+        dc = "green" if (diff >= 0 and higher_better) or (diff < 0 and not higher_better) else "red"
+        try:
+            return (label, fmt.format(va), fmt.format(vd), f"[{dc}]{diff:+.1f}[/{dc}]")
+        except Exception:
+            return (label, str(va), str(vd), "")
+
+    # ── Overall comparison ────────────────────────────────────────────────────
+    t = Table(
+        "Metric", "All days", f"Days {days_label}", "Δ",
+        box=box.MINIMAL_HEAVY_HEAD,
+        header_style="bold white on dark_blue",
+        title=f"[bold]All days vs Day-of-month filter ({days_label}) — {period_label}[/bold]",
+        show_lines=True,
+    )
+    for row_args in [
+        _row("Trades",           "trades",   "{:.0f}",  True),
+        _row("Win rate %",       "wr",        "{:.1f}",  True),
+        _row("Total P&L $",      "total",     "${:+,.0f}", True),
+        _row("P&L %",            "pnl_pct",   "{:+.1f}%", True),
+        _row("End equity $",     "end_equity","${:,.0f}", True),
+        _row("Max drawdown %",   "dd_pct",    "{:.1f}%",  False),
+        _row("Avg win $",        "avg_win",   "${:,.0f}", True),
+        _row("Avg loss $",       "avg_loss",  "${:,.0f}", False),
+        _row("Expectancy $",     "exp",       "${:+,.0f}", True),
+    ]:
+        t.add_row(*row_args)
+    console.print(t)
+
+    # ── Long vs short for the day-filtered run ────────────────────────────────
+    console.rule(f"[bold]Day-filter ({days_label}) — Long vs Short breakdown[/bold]")
+    print_long_short_report(f"Days {days_label} — {period_label}", stats_days, cadence)
 
 
 def _long_short_breakdown(trade_list: list) -> dict:
@@ -905,7 +1170,7 @@ def print_cadence_compare(all_results: dict):
         show_lines=True,
     )
 
-    atr_note = {1: "1h ≈ narrow", 2: "2h", 4: "4h ≈ wide", 8: "8h ≈ widest"}
+    atr_note = {1: "1h ≈ narrow", 2: "2h", 4: "4h ≈ wide", 8: "8h ≈ widest", 0.25: "15m", 0.5: "30m"}
 
     for c in cadences:
         res = all_results[c]
@@ -931,8 +1196,8 @@ def print_cadence_compare(all_results: dict):
         avg_trades = total_trades // 4
 
         t.add_row(
-            f"[bold]{c}h[/bold]",
-            atr_note.get(c, f"{c}h"),
+            f"[bold]{cadence_label(c)}[/bold]",
+            atr_note.get(c, cadence_label(c)),
             str(avg_trades),
             *year_cells,
             f"[{gc}]+${gain:,.0f} (+{gain/CAPITAL*100:.0f}%)[/{gc}]",
@@ -973,12 +1238,12 @@ def print_capital_efficiency(stats: dict, label: str):
         f"     Bars in trade  :  {stats['bars_in_trade']} / {stats['total_bars']} candles\n"
         f"     Time in market :  [{tc}]{t:.1f}%[/{tc}]  "
         f"(capital working {t:.1f}% of the time)\n"
-        f"     Avg hold       :  {hold_h:.1f}h  ({hold_b:.1f} × {cad}h candles)\n\n"
+        f"     Avg hold       :  {hold_h:.1f}h  ({hold_b:.1f} × {cadence_label(cad)} candles)\n\n"
         f"  [bold]2. Margin Efficiency[/bold]\n"
         f"     Avg notional   :  ${stats['avg_notional']:,.0f}  per trade\n"
         f"     Avg margin     :  ${stats['avg_margin']:,.0f}  per trade  "
         f"([{mc}]{m_pct:.1f}% of capital locked[/{mc}])\n"
-        f"     Leverage used  :  {stats['avg_notional']/stats['avg_margin']:.0f}x  "
+        f"     Leverage used  :  {stats['avg_notional']/(stats['avg_margin'] or 1):.0f}x  "
         f"(notional / margin)\n"
         f"     [dim]Lower margin% = more capital free for other assets or strategies[/dim]\n\n"
         f"  [bold]3. Return on Risk Deployed[/bold]\n"
@@ -1004,7 +1269,7 @@ def print_overlay_comparison(agg_with: dict, agg_without: dict, cadence: int = 4
         "Metric", "Without overlay (gate only)", "With overlay (best-call)",
         box=box.MINIMAL_HEAVY_HEAD,
         header_style="bold white on dark_blue",
-        title=f"[bold]Decisive overlay comparison — {cadence}h cadence[/bold]",
+        title=f"[bold]Decisive overlay comparison — {cadence_label(cadence)} cadence[/bold]",
         show_lines=True,
     )
     for (name, key) in [
@@ -1121,7 +1386,7 @@ def print_single_period(stats: dict, label: str, cadence: int,
     console.print(Panel(
         f"  Period  :  [bold]{start_date}  →  {end_date}[/bold]  "
         f"([dim]{days} days[/dim])\n"
-        f"  Cadence :  [bold]{cadence}h[/bold] candles   |   "
+        f"  Cadence :  [bold]{cadence_label(cadence)}[/bold] candles   |   "
         f"EMA({EMA_PERIOD}) {EMA_FILTER}   |   "
         f"NK filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX: {'ON' if SATURN_RX_BLOCK else 'OFF'}\n\n"
         f"  Trades  :  {stats['trades']}  "
@@ -1186,7 +1451,7 @@ def print_single_period(stats: dict, label: str, cadence: int,
                 str(n),
                 f"[cyan]{tr['side']}[/cyan]",
                 res,
-                f"{tr.get('bars', '?')} ({tr.get('bars', 0)*cadence}h)",
+                f"{tr.get('bars', '?')} ({tr.get('bars', 0)*cadence:.1f}h)" if cadence >= 1 else f"{tr.get('bars', '?')} ({tr.get('bars', 0)*cadence*60:.0f}m)",
                 f"[{pc}]{'+' if tr['pnl']>=0 else ''}{tr['pnl']:,.0f}[/{pc}]",
             )
         console.print(t2)
@@ -1273,7 +1538,7 @@ def run_risk_comparison(dfs: dict, funding: pd.Series,
         })
 
     title_str = (f"[bold]Risk per Trade Comparison — {label_prefix}  |  "
-                 f"{cadence}h cadence  |  EMA({EMA_PERIOD}) {EMA_FILTER}[/bold]")
+                 f"{cadence_label(cadence)} cadence  |  EMA({EMA_PERIOD}) {EMA_FILTER}[/bold]")
 
     # ── Table 1: Performance metrics ──────────────────────────────────────────
     t1_cols = ["Risk/trade", "Trades", "Win %", "Avg Win ($)", "Avg Loss ($)",
@@ -1404,7 +1669,9 @@ def run_risk_comparison(dfs: dict, funding: pd.Series,
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cadence", type=int, default=4,
-                        help="Candle size in hours (1, 2, 4, 8). Default 4.")
+                        help="Candle size in hours (1, 2, 4, 8). Default 4. Ignored if --cadence-min set.")
+    parser.add_argument("--cadence-min", type=int, default=None, metavar="MIN",
+                        help="Use 15m cadence (e.g. 15). Loads *_15m.csv from backtest.py --interval-min 15. Runs 2022-2025 + 2026-YTD with --long-short-periods.")
     parser.add_argument("--compare", action="store_true",
                         help="Compare all cadences (1h, 2h, 4h, 8h) side-by-side")
     parser.add_argument("--file", type=str, default=None,
@@ -1433,12 +1700,222 @@ def main():
                         help="End date for --year (inclusive). Default for 2026: 2026-03-17 (YTD through 17 Mar). Real-world: macro, SL/TP, funding, market fulfillment.")
     parser.add_argument("--compare-nakshatra", action="store_true",
                         help="Run backtest with Nakshatra filter OFF and ON; print detailed long/short comparison table for both.")
+    parser.add_argument("--monthly-days", type=str, default=None, metavar="DAYS",
+                        help="Comma-separated calendar day-of-month numbers to allow entries on "
+                             "(e.g. '1,3,7,9'). Compares all-days vs day-filtered, with long/short breakdown. "
+                             "Works with default 4-year run or --year.")
+    parser.add_argument("--compare-intrahour", action="store_true",
+                        help="Compare 15m, 30m, 1h cadences over 2022-2025 + 2026 YTD; use with --log to save to file.")
+    parser.add_argument("--log", type=str, default=None, metavar="FILE",
+                        help="Write all output to this file as well as stdout (e.g. logs/cadence_comparison.txt).")
+    parser.add_argument("--day-size", type=str,
+                        default="1=1.5,3=1.5,5=1.25,6=1.25,7=1.25,30=1.5,31=1.5",
+                        help="Day-of-month risk multipliers, applied to risk_pct when opening a trade (astro signal unchanged). "
+                             "Example: '1=1.5,3=1.5,5=1.25,6=1.25,7=1.25'.")
+    parser.add_argument("--compare-day-size", action="store_true",
+                        help="Run base sizing vs day-boost sizing side-by-side for the selected run mode (often with --compare-intrahour).")
+    parser.add_argument("--seasonality", action="store_true",
+                        help="Enable monthly/weekday seasonality sizing overlay (15th buy-low, 1/30/31 sell-high, Sundays buy, Mondays active).")
+    parser.add_argument("--buy-day-size", type=str, default="15=1.25",
+                        help="BUY-only day-of-month multipliers (e.g. '15=1.3'). Applied on top of --day-size.")
+    parser.add_argument("--sell-day-size", type=str, default="1=1.25,30=1.25,31=1.25",
+                        help="SELL-only day-of-month multipliers (e.g. '1=1.3,30=1.3,31=1.3'). Applied on top of --day-size.")
+    parser.add_argument("--buy-weekday-size", type=str, default="sun=1.2",
+                        help="BUY-only weekday multipliers (e.g. 'sun=1.2').")
+    parser.add_argument("--weekday-size", type=str, default="mon=1.05",
+                        help="All-sides weekday multipliers (e.g. 'mon=1.05').")
+    parser.add_argument("--overlay-suite", action="store_true",
+                        help="In --compare-intrahour: run base vs dayboost-only vs seasonality-only vs combined; print side-by-side + deltas.")
     args = parser.parse_args()
+
+    # Optional: tee output to log file (global console so all print_* use it)
+    _log_file_handle = None
+    if args.log:
+        log_path = Path(args.log)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        _log_file_handle = open(log_path, "w", encoding="utf-8")
+        def _close_log():
+            if _log_file_handle is not None:
+                _log_file_handle.close()
+        atexit.register(_close_log)
+        class _Tee:
+            def __init__(self, stdout, f):
+                self._out, self._f = stdout, f
+            def write(self, s): self._out.write(s); self._f.write(s)
+            def flush(self): self._out.flush(); self._f.flush()
+            def isatty(self): return getattr(self._out, "isatty", lambda: False)()
+        _tee = _Tee(sys.stdout, _log_file_handle)
+        globals()["console"] = Console(file=_tee, width=180, force_terminal=True)
+
+    # Effective cadence and CSV suffix (15m/30m use _15m.csv / _30m.csv from backtest.py --interval-min 15/30)
+    use_cadence_min = args.cadence_min is not None
+    cadence = (args.cadence_min / 60.0) if use_cadence_min else args.cadence
+    csv_suffix = f"_{args.cadence_min}m" if use_cadence_min else ""
+    use_15m = use_cadence_min  # for backward compat in branches that check use_15m
+    day_mult_map = parse_int_float_map(args.day_size)
+    buy_day_mult_map = parse_int_float_map(args.buy_day_size) if args.seasonality else {}
+    sell_day_mult_map = parse_int_float_map(args.sell_day_size) if args.seasonality else {}
+    weekday_mult_map = parse_weekday_map(args.weekday_size) if args.seasonality else {}
+    buy_weekday_mult_map = parse_weekday_map(args.buy_weekday_size) if args.seasonality else {}
+    # Minute cadence backtest for 2022-2025 + 2026 YTD: default to long-short-periods report
+    if use_cadence_min and not args.long_short_periods and args.year is None and not args.file and not args.compare_nakshatra and not args.compare_intrahour:
+        args.long_short_periods = True
+
+    # ── Compare 15m, 30m, 1h and optionally log to file ────────────────────────
+    if args.compare_intrahour:
+        INTRACADENCE_CONFIGS = [(0.25, "_15m"), (0.5, "_30m"), (1, "")]
+        funding = load_funding_rates()
+        book_r = max(0.0, float(args.book_profit))
+        kw_base = dict(use_intrabar=True, use_fees=True, use_slippage=True, use_funding=True,
+                       rr_ratio=args.rr, book_profit_at_r=book_r)
+        kw_dayboost = dict(**kw_base, day_risk_mult=day_mult_map)
+        kw_seasonality = dict(
+            **kw_base,
+            weekday_risk_mult=weekday_mult_map,
+            buy_day_risk_mult=buy_day_mult_map,
+            sell_day_risk_mult=sell_day_mult_map,
+            buy_weekday_risk_mult=buy_weekday_mult_map,
+        )
+        kw_combined = dict(
+            **kw_base,
+            day_risk_mult=day_mult_map,
+            weekday_risk_mult=weekday_mult_map,
+            buy_day_risk_mult=buy_day_mult_map,
+            sell_day_risk_mult=sell_day_mult_map,
+            buy_weekday_risk_mult=buy_weekday_mult_map,
+        )
+        kw_boost = dict(
+            **kw_base,
+            day_risk_mult=day_mult_map,
+            weekday_risk_mult=weekday_mult_map,
+            buy_day_risk_mult=buy_day_mult_map,
+            sell_day_risk_mult=sell_day_mult_map,
+            buy_weekday_risk_mult=buy_weekday_mult_map,
+        ) if (args.compare_day_size and (day_mult_map or args.seasonality)) else dict(**kw_base)
+        agg_2022_2025 = {}
+        stats_2026 = {}
+        agg_2022_2025_boost = {}
+        stats_2026_boost = {}
+        overlay_suite = None
+        if args.overlay_suite:
+            overlay_suite = {
+                "base": {"kw": kw_base, "2022_2025": {}, "2026": {}},
+                "dayboost": {"kw": (kw_dayboost if day_mult_map else kw_base), "2022_2025": {}, "2026": {}},
+                "seasonality": {"kw": (kw_seasonality if args.seasonality else kw_base), "2022_2025": {}, "2026": {}},
+                "combined": {"kw": (kw_combined if (day_mult_map or args.seasonality) else kw_base), "2022_2025": {}, "2026": {}},
+            }
+        log_dir = Path("logs")
+        years = [2022, 2023, 2024, 2025]
+        for cadence_val, suffix in INTRACADENCE_CONFIGS:
+            raw_dfs = {}
+            for y in years:
+                path = Path(f"logs/backtest_BTC_{y}-01-01_{y}-12-31{suffix}.csv")
+                if not path.exists():
+                    continue
+                df = pd.read_csv(path)
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                raw_dfs[y] = df
+            if not raw_dfs:
+                console.print(f"[yellow]No 2022-2025 data for {cadence_label(cadence_val)} (missing {suffix or '1h'} CSVs).[/yellow]")
+                continue
+            all_y = {}
+            all_y_boost = {}
+            for y, df in raw_dfs.items():
+                all_y[y] = simulate(df, funding, cadence=cadence_val, **kw_base)
+                if args.compare_day_size and (day_mult_map or args.seasonality):
+                    all_y_boost[y] = simulate(df, funding, cadence=cadence_val, **kw_boost)
+            agg_2022_2025[cadence_val] = _aggregate_yearly_results(all_y)
+            if args.compare_day_size and day_mult_map:
+                agg_2022_2025_boost[cadence_val] = _aggregate_yearly_results(all_y_boost)
+            ytd_paths = sorted(log_dir.glob(f"backtest_BTC_2026*{suffix}.csv"))
+            if ytd_paths:
+                df_2026 = pd.read_csv(ytd_paths[-1])
+                df_2026["timestamp"] = pd.to_datetime(df_2026["timestamp"], utc=True)
+                stats_2026[cadence_val] = simulate(df_2026, funding, cadence=cadence_val, **kw_base)
+                if args.compare_day_size and (day_mult_map or args.seasonality):
+                    stats_2026_boost[cadence_val] = simulate(df_2026, funding, cadence=cadence_val, **kw_boost)
+            else:
+                stats_2026[cadence_val] = None
+                stats_2026_boost[cadence_val] = None
+
+            # Overlay suite scenarios
+            if overlay_suite is not None:
+                for name, pack in overlay_suite.items():
+                    kw = pack["kw"]
+                    all_s = {y: simulate(df, funding, cadence=cadence_val, **kw) for y, df in raw_dfs.items()}
+                    pack["2022_2025"][cadence_val] = _aggregate_yearly_results(all_s)
+                    if ytd_paths:
+                        pack["2026"][cadence_val] = simulate(df_2026, funding, cadence=cadence_val, **kw)
+                    else:
+                        pack["2026"][cadence_val] = None
+        console.print()
+        console.rule("[bold]Cadence comparison: 15m vs 30m vs 1h[/bold]")
+        print_intrahour_comparison(agg_2022_2025, stats_2026, [(c, cadence_label(c)) for c, _ in INTRACADENCE_CONFIGS])
+
+        if overlay_suite is not None:
+            console.print()
+            console.rule("[bold]Overlay suite (base vs dayboost vs seasonality vs combined)[/bold]")
+            if args.seasonality:
+                console.print(f"[dim]Seasonality ON  |  day_size={day_mult_map}  buy_day={buy_day_mult_map}  sell_day={sell_day_mult_map}  weekday={weekday_mult_map}  buy_weekday={buy_weekday_mult_map}[/dim]")
+            else:
+                console.print(f"[dim]Seasonality OFF |  day_size={day_mult_map}[/dim]")
+            results_by_scenario = {k: {"2022_2025": v["2022_2025"], "2026": v["2026"]} for k, v in overlay_suite.items()}
+            print_overlay_suite_table(results_by_scenario, [(c, cadence_label(c)) for c, _ in INTRACADENCE_CONFIGS])
+        if args.compare_day_size and (day_mult_map or args.seasonality):
+            console.print()
+            console.rule("[bold]Cadence comparison (day-of-month boosted sizing)[/bold]")
+            if args.seasonality:
+                console.print(f"[dim]Seasonality ON  |  day_size={day_mult_map}  buy_day={buy_day_mult_map}  sell_day={sell_day_mult_map}  weekday={weekday_mult_map}  buy_weekday={buy_weekday_mult_map}[/dim]")
+            else:
+                console.print(f"[dim]Day size map: {day_mult_map}[/dim]")
+            print_intrahour_comparison(agg_2022_2025_boost, stats_2026_boost, [(c, cadence_label(c)) for c, _ in INTRACADENCE_CONFIGS])
+            console.print()
+            t = Table("Cadence", "Period", "Base P&L %", "Boosted P&L %", "Delta", box=box.MINIMAL_HEAVY_HEAD,
+                      header_style="bold white on dark_blue", title="[bold]Sizing impact (boost - base)[/bold]", show_lines=True)
+            for c, _ in INTRACADENCE_CONFIGS:
+                b = agg_2022_2025.get(c)
+                z = agg_2022_2025_boost.get(c)
+                if b and z:
+                    delta = z.get("pnl_pct", 0) - b.get("pnl_pct", 0)
+                    dc = "green" if delta >= 0 else "red"
+                    t.add_row(cadence_label(c), "2022–2025", f"{b.get('pnl_pct',0):+.1f}%", f"{z.get('pnl_pct',0):+.1f}%",
+                              f"[{dc}]{delta:+.1f}%[/{dc}]")
+                b6 = stats_2026.get(c)
+                z6 = stats_2026_boost.get(c)
+                if b6 and z6:
+                    delta = z6.get("pnl_pct", 0) - b6.get("pnl_pct", 0)
+                    dc = "green" if delta >= 0 else "red"
+                    t.add_row(cadence_label(c), "2026 YTD", f"{b6.get('pnl_pct',0):+.1f}%", f"{z6.get('pnl_pct',0):+.1f}%",
+                              f"[{dc}]{delta:+.1f}%[/{dc}]")
+            console.print(t)
+        for cadence_val, suffix in INTRACADENCE_CONFIGS:
+            a = agg_2022_2025.get(cadence_val)
+            if a:
+                console.print()
+                print_long_short_report(f"2022–2025 (4-year) — {cadence_label(cadence_val)}", a, cadence_val)
+            s6 = stats_2026.get(cadence_val)
+            if s6:
+                print_long_short_report(f"2026 YTD — {cadence_label(cadence_val)}", s6, cadence_val)
+            if args.compare_day_size and (day_mult_map or args.seasonality):
+                ab = agg_2022_2025_boost.get(cadence_val)
+                if ab:
+                    console.print()
+                    print_long_short_report(f"2022–2025 (4-year) — {cadence_label(cadence_val)} (boosted sizing)", ab, cadence_val)
+                s6b = stats_2026_boost.get(cadence_val)
+                if s6b:
+                    print_long_short_report(f"2026 YTD — {cadence_label(cadence_val)} (boosted sizing)", s6b, cadence_val)
+        if args.log:
+            console.print(f"\n[dim]Full output also written to {args.log}[/dim]")
+        return
 
     # ── Real-world single-year backtest (e.g. 2026 YTD through 17 Mar) ─────────
     if args.year is not None:
         log_dir = Path("logs")
         paths = sorted(log_dir.glob(f"backtest_BTC_{args.year}*.csv"))
+        if use_cadence_min:
+            paths = [p for p in paths if p.stem.endswith(f"_{args.cadence_min}m")]
+        else:
+            paths = [p for p in paths if not any(p.stem.endswith(f"_{m}m") for m in (15, 30))]
         if not paths:
             console.print(f"[red]No backtest CSV found for {args.year}. Add logs/backtest_BTC_{args.year}-01-01_*.csv (e.g. from scripts/backtest.py).[/red]")
             sys.exit(1)
@@ -1458,7 +1935,6 @@ def main():
         start_d = str(df["timestamp"].min().date())
         end_d = str(df["timestamp"].max().date())
         label = args.label or f"{args.year} YTD ({start_d} → {end_d})"
-        cadence = args.cadence
         book_r = max(0.0, float(args.book_profit))
         # Funding for this period
         fcsv = Path(f"logs/funding_BTCUSDT_{start_d}_{end_d}.csv")
@@ -1474,7 +1950,7 @@ def main():
         console.print()
         console.print(Panel.fit(
             f"[bold cyan]Real-world {args.year} YTD backtest[/bold cyan]\n"
-            f"[dim]Macro (EMA)  |  Intrabar SL/TP  |  Funding cost  |  Market fulfillment (slippage 0.05%, fee 0.05%/side)  |  Short-block  |  {cadence}h[/dim]\n"
+            f"[dim]Macro (EMA)  |  Intrabar SL/TP  |  Funding cost  |  Market fulfillment (slippage 0.05%, fee 0.05%/side)  |  Short-block  |  {cadence_label(cadence)}[/dim]\n"
             f"[dim]{start_d} → {end_d}  ({fpath.name})[/dim]",
             border_style="cyan",
         ))
@@ -1492,10 +1968,17 @@ def main():
             console.print()
             print_nakshatra_comparison(stats_off, stats_on, label, cadence)
             return
-        stats = simulate(df, funding, cadence=cadence,
-                         use_intrabar=True, use_fees=True,
-                         use_slippage=True, use_funding=True,
-                         rr_ratio=args.rr, book_profit_at_r=book_r)
+        kw = dict(use_intrabar=True, use_fees=True, use_slippage=True, use_funding=True,
+                  rr_ratio=args.rr, book_profit_at_r=book_r)
+        # ── Monthly-days comparison for --year mode ────────────────────────
+        if args.monthly_days:
+            day_set = {int(x.strip()) for x in args.monthly_days.split(",") if x.strip().isdigit()}
+            console.print(f"\n[bold cyan]Monthly-days filter: entries only on day(s) {sorted(day_set)} of each month[/bold cyan]\n")
+            stats_all  = simulate(df, funding, cadence=cadence, **kw)
+            stats_days = simulate(df, funding, cadence=cadence, **kw, allowed_entry_days=day_set)
+            print_monthly_days_report(stats_all, stats_days, day_set, label, cadence)
+            return
+        stats = simulate(df, funding, cadence=cadence, **kw)
         console.print()
         print_single_period(stats, label, cadence, start_d, end_d)
         print_long_short_report(label, stats, cadence)
@@ -1504,7 +1987,8 @@ def main():
 
     # ── Single-file mode (partial year / custom period) ────────────────────────
     if args.file:
-        cadence = args.cadence if args.cadence != 1 else 4   # default 4h for single-file
+        if not use_15m:
+            cadence = args.cadence if args.cadence != 1 else 4   # default 4h for single-file
         fpath   = Path(args.file)
         if not fpath.exists():
             console.print(f"[red]File not found: {fpath}[/red]")
@@ -1515,13 +1999,14 @@ def main():
             fcsvpath = Path(args.funding_file)
         else:
             # Try to match logs/funding_BTCUSDT_{start}_{end}.csv from filename
-            stem = fpath.stem  # e.g. backtest_BTC_2026-01-01_2026-02-22
+            stem = fpath.stem  # e.g. backtest_BTC_2026-01-01_2026-02-22 or ..._2026-02-22_15m
             parts = stem.split("_")
-            # filename pattern: backtest_BTC_START_END
-            # funding pattern:  funding_BTCUSDT_START_END
+            # filename pattern: backtest_BTC_START_END or backtest_BTC_START_END_15m
             try:
-                start_d = parts[-2]
-                end_d   = parts[-1]
+                if len(parts) >= 4 and parts[-1] == "15m":
+                    start_d, end_d = parts[-3], parts[-2]
+                else:
+                    start_d, end_d = parts[-2], parts[-1]
                 fcsvpath = Path(f"logs/funding_BTCUSDT_{start_d}_{end_d}.csv")
             except Exception:
                 fcsvpath = FUNDING_CSV
@@ -1551,7 +2036,7 @@ def main():
             "[dim]Intrabar SL/TP  |  Slippage 0.05%  |  Fee 0.05%/side  |  "
             "Real funding rates[/dim]\n"
             f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  RR {args.rr}:1  |  "
-            f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX block: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX block: {'ON' if SATURN_RX_BLOCK else 'OFF'}  |  Cadence: {cadence}h{book_line}[/dim]",
+            f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX block: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX block: {'ON' if SATURN_RX_BLOCK else 'OFF'}  |  Cadence: {cadence_label(cadence)}{book_line}[/dim]",
             border_style="cyan",
         ))
 
@@ -1595,7 +2080,7 @@ def main():
             )
         return
 
-    cadences  = [1, 2, 4, 8] if args.compare else [args.cadence]
+    cadences  = [1, 2, 4, 8] if args.compare else [cadence]
     years     = [2022, 2023, 2024, 2025]
     funding   = load_funding_rates()
     book_r    = max(0.0, float(args.book_profit))
@@ -1611,14 +2096,14 @@ def main():
         "Slippage 0.05%  |  Fee 0.05%/side  |  Real funding rates[/dim]\n"
         f"[dim]EMA({EMA_PERIOD}) {EMA_FILTER}  |  "
         f"Nakshatra filter: {'ON' if NK_FILTER else 'OFF'}  |  Mercury RX: {'ON' if MERCURY_RX_BLOCK else 'OFF'}  Saturn RX: {'ON' if SATURN_RX_BLOCK else 'OFF'}  |  "
-        f"Cadence: {', '.join(f'{c}h' for c in cadences)}{book_line_4y}[/dim]",
+        f"Cadence: {', '.join(cadence_label(c) for c in cadences)}{book_line_4y}[/dim]",
         border_style="cyan",
     ))
 
-    # Load all CSVs once
+    # Load all CSVs once (use _15m suffix when --cadence-min 15)
     raw_dfs = {}
     for y in years:
-        path = Path(f"logs/backtest_BTC_{y}-01-01_{y}-12-31.csv")
+        path = Path(f"logs/backtest_BTC_{y}-01-01_{y}-12-31{csv_suffix}.csv")
         if not path.exists():
             console.print(f"[red]Missing {path} — skipping {y}[/red]")
             continue
@@ -1628,13 +2113,12 @@ def main():
 
     # ── Nakshatra OFF vs ON — detailed long/short comparison ───────────────────
     if args.compare_nakshatra and raw_dfs:
-        cadence = args.cadence
         funding = load_funding_rates()
         book_r = max(0.0, float(args.book_profit))
         all_off = {}
         all_on = {}
         for y, df in raw_dfs.items():
-            console.print(f"[dim]Comparing Nakshatra for {y} @ {cadence}h...[/dim]", end="\r")
+            console.print(f"[dim]Comparing Nakshatra for {y} @ {cadence_label(cadence)}...[/dim]", end="\r")
             all_off[y] = simulate(df, funding, cadence=cadence,
                                   use_intrabar=True, use_fees=True,
                                   use_slippage=True, use_funding=True,
@@ -1654,7 +2138,6 @@ def main():
 
     # ── Long vs short by period: 2022-2025 vs 2026-YTD ────────────────────────
     if args.long_short_periods:
-        cadence = args.cadence
         funding = load_funding_rates()
         book_r = max(0.0, float(args.book_profit))
 
@@ -1671,11 +2154,11 @@ def main():
             print_long_short_report("2022–2025 (4-year)", agg_2022_2025, cadence)
             print_short_astro_report("2022–2025 (4-year)", agg_2022_2025.get("trade_list", []))
         else:
-            console.print("[yellow]No 2022-2025 data (missing logs/backtest_BTC_YYYY-01-01_YYYY-12-31.csv).[/yellow]")
+            console.print(f"[yellow]No 2022-2025 data (missing logs/backtest_BTC_YYYY-01-01_YYYY-12-31{csv_suffix}.csv).[/yellow]")
 
-        # 2026-YTD: look for any backtest CSV that starts in 2026
+        # 2026-YTD: look for any backtest CSV that starts in 2026 (with same cadence suffix)
         log_dir = Path("logs")
-        ytd_2026_paths = sorted(log_dir.glob("backtest_BTC_2026*.csv"))
+        ytd_2026_paths = sorted(log_dir.glob(f"backtest_BTC_2026*{csv_suffix}.csv"))
         if ytd_2026_paths:
             # Use the file that covers 2026-01-01 to latest (often one file)
             path_2026 = ytd_2026_paths[-1]
@@ -1712,7 +2195,7 @@ def main():
         all_with = {}
         all_without = {}
         for y, df in raw_dfs.items():
-            console.print(f"[dim]Comparing overlay for {y} @ {cadence}h...[/dim]", end="\r")
+            console.print(f"[dim]Comparing overlay for {y} @ {cadence_label(cadence)}...[/dim]", end="\r")
             all_with[y] = simulate(df, funding, cadence=cadence,
                                   use_intrabar=True, use_fees=True,
                                   use_slippage=True, use_funding=True,
@@ -1751,7 +2234,7 @@ def main():
         for c in cadences:
             agg_no = _aggregate_yearly_results(all_results_no[c])
             agg_yes = _aggregate_yearly_results(all_results_yes[c])
-            console.rule(f"[bold]Early book profit @ {book_r}R vs no early book — {c}h cadence[/bold]")
+            console.rule(f"[bold]Early book profit @ {book_r}R vs no early book — {cadence_label(c)} cadence[/bold]")
             print_book_profit_comparison(agg_no, agg_yes, f"4-Year Historical ({c}h)", c, book_r)
             # Per-year table
             t = Table(
@@ -1769,16 +2252,51 @@ def main():
             console.print()
         return
 
+    # ── Monthly-days filter comparison (4-year) ───────────────────────────────
+    if args.monthly_days:
+        day_set = {int(x.strip()) for x in args.monthly_days.split(",") if x.strip().isdigit()}
+        cadence = cadences[-1]
+        console.print(f"\n[bold cyan]Monthly-days filter: entries only on day(s) {sorted(day_set)} of each month — 2022–2025 @ {cadence_label(cadence)}[/bold cyan]\n")
+        all_all  = {}
+        all_days = {}
+        sim_kw_days = dict(use_intrabar=True, use_fees=True, use_slippage=True, use_funding=True,
+                           rr_ratio=args.rr, book_profit_at_r=book_r)
+        for y, df in raw_dfs.items():
+            console.print(f"[dim]Simulating {y} @ {cadence_label(cadence)} (all days + day-filter)...[/dim]", end="\r")
+            all_all[y]  = simulate(df, funding, cadence=cadence, **sim_kw_days)
+            all_days[y] = simulate(df, funding, cadence=cadence, **sim_kw_days, allowed_entry_days=day_set)
+        console.print(" " * 60, end="\r")
+        agg_all  = _aggregate_yearly_results(all_all)
+        agg_days = _aggregate_yearly_results(all_days)
+        days_label = ",".join(str(d) for d in sorted(day_set))
+        print_monthly_days_report(agg_all, agg_days, day_set, f"2022–2025 (4-year, {cadence_label(cadence)})", cadence)
+        # Per-year table
+        t = Table(
+            "Year", "All days P&L%", f"Days {days_label} P&L%", "All WR", f"Days {days_label} WR",
+            box=box.SIMPLE, header_style="bold",
+            title=f"[bold]Per-year: All days vs Days {days_label}[/bold]",
+        )
+        for y in sorted(all_all.keys()):
+            sn, sy = all_all[y], all_days[y]
+            pn, py = sn["pnl_pct"], sy["pnl_pct"]
+            wn, wy = sn["wr"], sy["wr"]
+            pc = "green" if py >= pn else "red"
+            wc = "green" if wy >= wn else "red"
+            t.add_row(str(y), f"{pn:+.1f}%", f"[{pc}]{py:+.1f}%[/{pc}]",
+                      f"{wn:.0f}%", f"[{wc}]{wy:.0f}%[/{wc}]")
+        console.print(t)
+        console.print()
+        return
+
     # Run simulations (single run, possibly with book_profit)
+    sim_kw = dict(use_intrabar=True, use_fees=True, use_slippage=True, use_funding=True,
+                  rr_ratio=args.rr, book_profit_at_r=book_r)
     all_results = {}
     for c in cadences:
         all_results[c] = {}
         for y, df in raw_dfs.items():
             console.print(f"[dim]Simulating {y} @ {c}h...[/dim]", end="\r")
-            all_results[c][y] = simulate(df, funding, cadence=c,
-                                         use_intrabar=True, use_fees=True,
-                                         use_slippage=True, use_funding=True,
-                                         rr_ratio=args.rr, book_profit_at_r=book_r)
+            all_results[c][y] = simulate(df, funding, cadence=c, **sim_kw)
     console.print(" " * 50, end="\r")
 
     if args.compare:

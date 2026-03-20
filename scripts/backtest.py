@@ -7,8 +7,9 @@ One signal per `interval` hours; each row = one candle close.
 Usage:
     python scripts/backtest.py --asset BTC --start 2024-01-01 --end 2024-12-31   # 4h
     python scripts/backtest.py --asset BTC --start 2023-01-01 --interval 1       # 1h
+    python scripts/backtest.py --asset BTC --start 2022-01-01 --end 2026-03-17 --interval-min 15   # 15m
 
-Results are saved to logs/backtest_{asset}_{date}.csv
+Results are saved to logs/backtest_{asset}_{date}.csv (or _15m.csv when --interval-min 15).
 """
 import argparse
 import json
@@ -32,9 +33,10 @@ logger.remove()
 logger.add(sys.stderr, level="WARNING")
 
 
-def fetch_historical_prices(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+def fetch_historical_prices(symbol: str, start: datetime, end: datetime, timeframe: str = "1h") -> pd.DataFrame:
     """
-    Fetch hourly OHLCV from Binance public API for the backtest period.
+    Fetch OHLCV from Binance public API for the backtest period.
+    timeframe: "1h", "15m", or "30m" (Binance supports these).
 
     Note: this uses Binance as a historical DATA SOURCE only — no API key needed.
     The live trading engine is Hyperliquid-only (exchange/market_data.py).
@@ -45,14 +47,16 @@ def fetch_historical_prices(symbol: str, start: datetime, end: datetime) -> pd.D
     exchange = ccxt.binance({"enableRateLimit": True})
     since_ms = int(start.timestamp() * 1000)
     end_ms = int(end.timestamp() * 1000)
+    # Step size in ms: 1h = 3600000, 30m = 1800000, 15m = 900000
+    step_ms = {"1h": 3600000, "30m": 1800000, "15m": 900000}.get(timeframe, 3600000)
 
     all_candles = []
     while since_ms < end_ms:
-        candles = exchange.fetch_ohlcv(symbol, "1h", since=since_ms, limit=1000)
+        candles = exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=1000)
         if not candles:
             break
         all_candles.extend(candles)
-        since_ms = candles[-1][0] + 3600000  # advance 1 hour
+        since_ms = candles[-1][0] + step_ms
         print(f"  Fetched up to {pd.to_datetime(since_ms, unit='ms', utc=True).date()}", end="\r")
 
     df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -80,7 +84,12 @@ def get_price_at(df: pd.DataFrame, dt: datetime) -> float:
     return get_candle_at(df, dt)["close"]
 
 
-def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours: int = 1):
+def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours: int = 1,
+                 interval_min: int = None):
+    """
+    interval_hours: used when interval_min is None (1, 4, etc.).
+    interval_min: when set (e.g. 15), use 15m candles and step every 15 minutes; interval_hours ignored.
+    """
     dna_path = Path(__file__).parent.parent / "assets_dna.json"
     with open(dna_path) as f:
         all_assets = json.load(f)
@@ -95,23 +104,30 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
         sys.exit(1)
 
     symbol = dna["symbol"]
-    # Use spot_symbol for Binance historical price fetching.
-    # The main symbol may be exchange-specific (e.g. Hyperliquid BTC/USDC:USDC)
-    # which Binance does not recognise.
     price_symbol = dna.get("spot_symbol", symbol)
 
     from dateutil.parser import parse
     genesis_date = parse(dna["genesis_datetime"]).date()
 
-    print(f"\nFetching historical prices for {price_symbol} (spot)...")
-    price_df = fetch_historical_prices(price_symbol, start, end)
-    print(f"  Got {len(price_df)} hourly candles.")
+    if interval_min is not None:
+        timeframe = f"{interval_min}m"  # 15m or 30m
+        print(f"\nFetching historical prices for {price_symbol} (spot, {timeframe})...")
+        price_df = fetch_historical_prices(price_symbol, start, end, timeframe=timeframe)
+        print(f"  Got {len(price_df)} {timeframe} candles.")
+        step_delta = timedelta(minutes=interval_min)
+        interval_label = f"{interval_min}m"
+    else:
+        print(f"\nFetching historical prices for {price_symbol} (spot)...")
+        price_df = fetch_historical_prices(price_symbol, start, end, timeframe="1h")
+        print(f"  Got {len(price_df)} hourly candles.")
+        step_delta = timedelta(hours=interval_hours)
+        interval_label = f"{interval_hours}h"
 
     score_history = ScoreHistory(window=config.SCORE_HISTORY_WINDOW)
     results = []
     current = start
 
-    print(f"\nRunning backtest ({start.date()} → {end.date()}, every {interval_hours}h)...")
+    print(f"\nRunning backtest ({start.date()} → {end.date()}, every {interval_label})...")
 
     while current <= end:
         jd = datetime_to_jd(current)
@@ -171,11 +187,13 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
             "moon_phase_deg":          round(events.get("moon_phase_deg", 0), 2),
         })
 
-        current += timedelta(hours=interval_hours)
+        current += step_delta
 
     # ── Analysis ──────────────────────────────────────────────────────────────
     df = pd.DataFrame(results)
-    df["next_price"] = df["price"].shift(-interval_hours)
+    # Next period = next row (1 row for 1h/4h, 1 row for 15m)
+    shift_periods = 1
+    df["next_price"] = df["price"].shift(-shift_periods)
     df["price_change_pct"] = (df["next_price"] - df["price"]) / df["price"] * 100
 
     trade_signals = df[df["action"].isin(["STRONG_BUY", "WEAK_BUY", "STRONG_SELL", "WEAK_SELL"])]
@@ -204,8 +222,9 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
         res_accuracy = (resonance_buys["price_change_pct"] > 0).mean()
         print(f"Resonance day BUY acc: {res_accuracy:.1%} ({len(resonance_buys)} signals)")
 
-    # Save
-    out_path = Path(f"logs/backtest_{asset_key}_{start.date()}_{end.date()}.csv")
+    # Save (suffix _15m / _30m when minute cadence so final_backtest can load by convention)
+    suffix = f"_{interval_min}m" if interval_min is not None else ""
+    out_path = Path(f"logs/backtest_{asset_key}_{start.date()}_{end.date()}{suffix}.csv")
     out_path.parent.mkdir(exist_ok=True)
     df.to_csv(out_path, index=False)
     print(f"\nFull results saved to: {out_path}")
@@ -217,11 +236,13 @@ def main():
     parser.add_argument("--start", type=str, default="2024-01-01")
     parser.add_argument("--end", type=str, default="2024-12-31")
     parser.add_argument("--interval", type=int, default=4, help="Hours between signals (default 4 = 4h cadence)")
+    parser.add_argument("--interval-min", type=int, default=None, metavar="MIN",
+                        help="Use minute cadence (15 or 30). Saves to ..._15m.csv or ..._30m.csv")
     args = parser.parse_args()
 
     start = datetime.fromisoformat(args.start).replace(tzinfo=timezone.utc)
     end = datetime.fromisoformat(args.end).replace(tzinfo=timezone.utc)
-    run_backtest(args.asset, start, end, args.interval)
+    run_backtest(args.asset, start, end, args.interval, interval_min=args.interval_min)
 
 
 if __name__ == "__main__":
