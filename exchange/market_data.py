@@ -12,6 +12,8 @@ in late 2023 and lacks the 2022–2023 data needed for multi-year backtests.
 The live trading engine is Hyperliquid-only.
 """
 import os
+import random
+import time
 import ccxt
 import numpy as np
 import pandas as pd
@@ -49,6 +51,59 @@ def _build_exchange() -> ccxt.hyperliquid:
 
 _exchange: ccxt.hyperliquid = None
 
+# Simple in-memory ticker cache to avoid duplicated requests within a short window.
+# This helps when multiple bot components query the same symbol close together.
+_ticker_cache: dict[str, tuple[float, float]] = {}  # symbol -> (price, epoch_seconds)
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    """
+    Best-effort detection for HTTP 429 rate limiting.
+    ccxt error objects can vary by backend/version, so we check both attributes
+    and the string message.
+    """
+    status = getattr(exc, "status", None)
+    if status == 429:
+        return True
+    msg = str(exc).lower()
+    return "429" in msg or "too many requests" in msg
+
+
+def _sleep_backoff_seconds(attempt: int, *, base_delay_s: float, max_delay_s: float) -> None:
+    # attempt is 1-based (attempt=1 -> base_delay_s)
+    delay = min(max_delay_s, base_delay_s * (2 ** (attempt - 1)))
+    # Add a small jitter to avoid thundering herd across restarts.
+    delay *= random.uniform(0.85, 1.15)
+    time.sleep(delay)
+
+
+def _with_rate_limit_retries(
+    *,
+    symbol: str,
+    op_name: str,
+    attempts: int,
+    base_delay_s: float,
+    max_delay_s: float,
+    fn,
+):
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limited(e) and attempt < attempts:
+                logger.warning(
+                    f"{op_name} rate-limited on {symbol} (attempt {attempt}/{attempts}); "
+                    f"retrying with backoff..."
+                )
+                _sleep_backoff_seconds(attempt, base_delay_s=base_delay_s, max_delay_s=max_delay_s)
+                continue
+            # Non-rate-limit error, or we're out of retries.
+            raise
+    assert last_exc is not None
+    raise last_exc
+
 
 def get_exchange() -> ccxt.hyperliquid:
     """Return the shared Hyperliquid exchange instance (lazy singleton)."""
@@ -69,7 +124,17 @@ def fetch_ohlcv(symbol: str, timeframe: str = "4h", limit: int = 100) -> pd.Data
     """
     try:
         ex = get_exchange()
-        raw = ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+        def _fetch():
+            return ex.fetch_ohlcv(symbol, timeframe, limit=limit)
+
+        raw = _with_rate_limit_retries(
+            symbol=symbol,
+            op_name="OHLCV",
+            attempts=3,
+            base_delay_s=1.0,
+            max_delay_s=8.0,
+            fn=_fetch,
+        )
         df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df.set_index("timestamp", inplace=True)
@@ -82,9 +147,31 @@ def fetch_ohlcv(symbol: str, timeframe: str = "4h", limit: int = 100) -> pd.Data
 def get_current_price(symbol: str) -> float:
     """Fetch the latest mark/last price from Hyperliquid."""
     try:
+        ttl_s = float(os.getenv("HYPERLIQUID_TICKER_CACHE_TTL_SECONDS", "20"))
+        now = time.time()
+        cached = _ticker_cache.get(symbol)
+        if cached:
+            cached_price, cached_at = cached
+            if now - cached_at <= ttl_s:
+                return cached_price
+
         ex = get_exchange()
-        ticker = ex.fetch_ticker(symbol)
-        return float(ticker["last"])
+
+        def _fetch():
+            ticker = ex.fetch_ticker(symbol)
+            return float(ticker["last"])
+
+        price = _with_rate_limit_retries(
+            symbol=symbol,
+            op_name="Price",
+            attempts=3,
+            base_delay_s=1.0,
+            max_delay_s=8.0,
+            fn=_fetch,
+        )
+
+        _ticker_cache[symbol] = (price, now)
+        return price
     except Exception as e:
         logger.error(f"Price fetch failed for {symbol} on Hyperliquid: {e}")
         return 0.0
@@ -206,9 +293,15 @@ def get_price_atr_ema(symbol: str) -> tuple[float, float, float, float, float]:
     last_high = float(df["high"].iloc[-1]) if not df.empty else price
     last_low  = float(df["low"].iloc[-1])  if not df.empty else price
 
-    logger.info(
-        f"{symbol} — Price: {price:.2f} | "
-        f"ATR({config.ATR_PERIOD})/{tf}: {atr:.2f} | "
-        f"EMA({config.EMA_PERIOD})/{tf}: {ema:.2f}"
-    )
+    if price <= 0:
+        logger.warning(
+            f"{symbol} — price unavailable (<=0); skipping cycle. "
+            f"ATR({config.ATR_PERIOD})/{tf}: {atr:.2f} | EMA({config.EMA_PERIOD})/{tf}: {ema:.2f}"
+        )
+    else:
+        logger.info(
+            f"{symbol} — Price: {price:.2f} | "
+            f"ATR({config.ATR_PERIOD})/{tf}: {atr:.2f} | "
+            f"EMA({config.EMA_PERIOD})/{tf}: {ema:.2f}"
+        )
     return price, atr, ema, last_high, last_low
