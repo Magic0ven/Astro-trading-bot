@@ -178,6 +178,10 @@ MAX_OPEN_BARS         = int(os.getenv("MAX_OPEN_BARS", "12"))
 RR_RATIO              = float(os.getenv("RR_RATIO", "2.0"))
 ATR_MULTIPLIER        = float(os.getenv("ATR_MULTIPLIER", "1.5"))
 
+# Candle timeframe used for live indicator calculations (ATR + EMA) and for
+# the last-candle high/low used in paper-mode intrabar TP/SL checks.
+ATR_EMA_TIMEFRAME    = os.getenv("ATR_EMA_TIMEFRAME", "4h")
+
 # ── Position sizing overlays (dayboost + seasonality) ──────────────────────────
 # These scale *risk per trade* (and therefore notional size) without changing the
 # astro-derived direction. Multipliers are applied only when opening a new trade.

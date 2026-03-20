@@ -191,12 +191,14 @@ def get_price_atr_ema(symbol: str) -> tuple[float, float, float, float, float]:
     """
     Returns (current_price, atr, ema, last_candle_high, last_candle_low).
 
-    last_candle_high/low are from the most recently closed 4h bar. Used for
+    last_candle_high/low are from the most recently closed
+    config.ATR_EMA_TIMEFRAME bar. Used for
     intrabar TP/SL checks in paper mode (so we detect TP hit when price
     wicks to target then bounces within the same bar).
     """
     needed = max(config.ATR_PERIOD, config.EMA_PERIOD) + 20
-    df    = fetch_ohlcv(symbol, timeframe="4h", limit=needed)
+    tf    = getattr(config, "ATR_EMA_TIMEFRAME", "4h")
+    df    = fetch_ohlcv(symbol, timeframe=tf, limit=needed)
     price = get_current_price(symbol)
     atr   = compute_atr(df, period=config.ATR_PERIOD)
     ema   = compute_ema(df, period=config.EMA_PERIOD)
@@ -206,7 +208,7 @@ def get_price_atr_ema(symbol: str) -> tuple[float, float, float, float, float]:
 
     logger.info(
         f"{symbol} — Price: {price:.2f} | "
-        f"ATR({config.ATR_PERIOD})/4h: {atr:.2f} | "
-        f"EMA({config.EMA_PERIOD})/4h: {ema:.2f}"
+        f"ATR({config.ATR_PERIOD})/{tf}: {atr:.2f} | "
+        f"EMA({config.EMA_PERIOD})/{tf}: {ema:.2f}"
     )
     return price, atr, ema, last_high, last_low
