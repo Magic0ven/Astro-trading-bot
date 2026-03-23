@@ -114,6 +114,27 @@ def apply_decisive_overlay(action: str, astro_events: Optional[dict] = None) -> 
     return out
 
 
+def short_confidence_score(score: float, medium: float, slope: Optional[float]) -> float:
+    """
+    Heuristic confidence score for SELL quality in [0, 1].
+    Higher means stronger bearish structure (score below medium + negative slope).
+    """
+    if slope is None:
+        return 0.0
+
+    # Bearish distance below medium (normalized, robust to scale drift).
+    denom = max(abs(medium), 1.0)
+    gap = max(0.0, (medium - score) / denom)
+    gap_term = min(1.0, gap / 0.25)  # full credit once score is 25% below medium
+
+    # Bearish slope strength beyond threshold.
+    slope_excess = max(0.0, (-slope) - config.SLOPE_THRESHOLD)
+    slope_term = min(1.0, slope_excess / max(config.SLOPE_THRESHOLD, 1e-6))
+
+    # Weighted blend: score regime + momentum.
+    return (0.6 * gap_term) + (0.4 * slope_term)
+
+
 # ── Position size calculator ───────────────────────────────────────────────────
 
 def calculate_position_size(
@@ -399,7 +420,16 @@ def generate_signal(
             filter_reason = f"EMA_FILTER:price({current_price:.2f})<EMA({ema:.2f})_blocked_BUY"
             final_action = "NO_TRADE"
 
-    # 7c. Short-block filter — skip SHORT when astro conditions historically lose (backtest 2022–2025)
+    # 7c. Short-confidence filter — reject low-quality SELL setups first.
+    short_conf = 0.0
+    if "SELL" in (final_action or ""):
+        short_conf = short_confidence_score(vedic_score_adj, v_medium, v_slope)
+        # Non-configurable floor to reduce short bias from marginal SELLs.
+        if short_conf < 0.55:
+            filter_reason = f"SHORT_CONFIDENCE:{short_conf:.2f}<0.55"
+            final_action = "NO_TRADE"
+
+    # 7d. Short-block filter — skip SHORT when astro conditions historically lose (backtest 2022–2025)
     if (
         filter_reason is None
         and "SELL" in (final_action or "")
@@ -420,7 +450,7 @@ def generate_signal(
             filter_reason = "SHORT_BLOCK:" + ",".join(block_reasons)
             final_action = "NO_TRADE"
 
-    # 7d. Macro regime filter (fixed: BTC EMA282 on 45m)
+    # 7e. Macro regime filter (fixed: BTC EMA282 on 45m)
     if (
         filter_reason is None
         and final_action not in ("HOLD", "NO_TRADE")
@@ -486,6 +516,7 @@ def generate_signal(
         "stop_loss": round(stop_loss, 2),
         "target": round(target, 2),
         "position_size_usdt": round(position_size, 2),
+        "short_confidence": round(short_conf, 4),
         "risk_pct_used": round(sizing.get("risk_pct_used", 0.0), 6),
         "risk_amount_usdt": round(sizing.get("risk_amount_usdt", 0.0), 4),
         "margin_required_usdt": round(sizing.get("margin_required_usdt", 0.0), 4),

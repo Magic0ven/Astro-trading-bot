@@ -97,6 +97,17 @@ def display_signal(signal: dict):
     table.add_row("Stop Loss",  f"${signal.get('stop_loss', 0):,.2f}")
     table.add_row("Target",     f"${signal.get('target', 0):,.2f}")
     table.add_row("Size (USDT)",f"${signal.get('position_size_usdt', 0):,.2f}")
+    risk_amt = signal.get("risk_amount_usdt")
+    margin_req = signal.get("margin_required_usdt")
+    if risk_amt is not None:
+        table.add_row("Risk $", f"${risk_amt:,.2f}")
+    if margin_req is not None:
+        table.add_row("Margin est.", f"${margin_req:,.2f}")
+    if signal.get("sizing_skip_reason"):
+        table.add_row("Sizing skip", str(signal.get("sizing_skip_reason")))
+    sc = signal.get("short_confidence")
+    if sc is not None and "SELL" in action:
+        table.add_row("Short conf.", f"{float(sc):.2f}")
     cap = signal.get("effective_capital", 0)
     table.add_row("Capital base", f"${cap:,.2f}  ({config.CAPITAL_PCT*100:.0f}% of balance)")
     table.add_row("", "")

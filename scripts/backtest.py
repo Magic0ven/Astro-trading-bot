@@ -26,7 +26,12 @@ import config
 from core.astro_engine import datetime_to_jd, get_sky_state, compute_composite_score
 from core.numerology import full_numerology_report, numerology_multiplier
 from core.score_history import ScoreHistory
-from core.signal_engine import _system_signal, dual_system_gate, apply_decisive_overlay
+from core.signal_engine import (
+    _system_signal,
+    dual_system_gate,
+    apply_decisive_overlay,
+    short_confidence_score,
+)
 
 # Suppress info logs during backtest
 logger.remove()
@@ -160,6 +165,12 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
             vs = _system_signal(v_score, hist["vedic"]["medium"], hist["vedic"]["slope"])
             gate = dual_system_gate(ws, vs)
             action = apply_decisive_overlay(gate, sky.get("astro_events"))
+
+            # Mirror live short-confidence gate to keep backtest/live aligned.
+            if "SELL" in (action or ""):
+                sc = short_confidence_score(v_score, hist["vedic"]["medium"], hist["vedic"]["slope"])
+                if sc < 0.55:
+                    action = "NO_TRADE"
         else:
             action = "COLLECTING_DATA"
 
