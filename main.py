@@ -26,7 +26,12 @@ load_dotenv()
 import config
 from core.signal_engine import generate_signal
 from core.score_history import ScoreHistory
-from exchange.market_data import get_price_atr_ema, get_account_balance, get_current_price
+from exchange.market_data import (
+    get_price_atr_ema,
+    get_account_balance,
+    get_current_price,
+    get_regime_ema_state,
+)
 from exchange.trade_executor import (
     dispatch_signal,
     check_and_close_stale_positions,
@@ -112,6 +117,15 @@ def display_signal(signal: dict):
     ema_val = signal.get("ema_value")
     if ema_val is not None:
         table.add_row("EMA", f"${ema_val:,.2f}  (filter: {config.EMA_FILTER})")
+    reg_ema = signal.get("regime_ema")
+    reg_px = signal.get("regime_price")
+    if reg_ema is not None and reg_px is not None:
+        reg_state = "TREND_UP" if reg_px > reg_ema else "TREND_DOWN"
+        table.add_row(
+            "Regime",
+            f"{reg_state}  "
+            f"(px ${reg_px:,.2f} vs EMA{signal.get('regime_period', 282)}/{signal.get('regime_timeframe', '45m')} ${reg_ema:,.2f})"
+        )
     if signal.get("filter_reason"):
         table.add_row("[yellow]Filtered[/yellow]", signal["filter_reason"])
 
@@ -237,12 +251,15 @@ def bot_cycle():
     update_peak_equity(current_equity)
 
     # Generate signal (EMA filter + Nakshatra block applied inside)
+    regime_price, regime_ema = get_regime_ema_state()
     signal = generate_signal(
         asset_dna=asset_dna,
         score_history=score_history,
         current_price=price,
         atr=atr,
         current_ema=ema,
+        regime_price=regime_price,
+        regime_ema=regime_ema,
         capital=capital,
     )
 
@@ -258,6 +275,8 @@ def bot_cycle():
                 current_price=price,
                 atr=atr,
                 current_ema=ema,
+                regime_price=regime_price,
+                regime_ema=regime_ema,
                 capital=capital,
             )
 

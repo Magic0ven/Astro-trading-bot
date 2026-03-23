@@ -305,3 +305,24 @@ def get_price_atr_ema(symbol: str) -> tuple[float, float, float, float, float]:
             f"EMA({config.EMA_PERIOD})/{tf}: {ema:.2f}"
         )
     return price, atr, ema, last_high, last_low
+
+
+def get_regime_ema_state() -> tuple[float, float]:
+    """
+    Returns (benchmark_price, benchmark_ema) for macro regime detection.
+    Fixed model: BTC/USDT EMA(282) on 45m (non-configurable).
+    """
+    symbol = "BTC/USDT"
+    tf = "45m"
+    period = 282
+    needed = max(period + 20, 320)
+
+    df = fetch_ohlcv(symbol, timeframe=tf, limit=needed)
+    price = get_current_price(symbol)
+    ema = compute_ema(df, period=period)
+
+    if price > 0 and ema > 0:
+        logger.info(f"Regime {symbol} — Price: {price:.2f} | EMA({period})/{tf}: {ema:.2f}")
+    else:
+        logger.warning(f"Regime {symbol} unavailable — Price: {price:.2f}, EMA: {ema:.2f}")
+    return price, ema

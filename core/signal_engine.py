@@ -123,7 +123,8 @@ def calculate_position_size(
     signal_strength: str,
     capital: float = 0.0,
     now: Optional[datetime] = None,
-) -> float:
+    return_details: bool = False,
+) -> float | tuple[float, dict]:
     """
     Returns position size in USDT notional value.
 
@@ -157,21 +158,84 @@ def calculate_position_size(
         if mult <= 0:
             mult = 1.0
 
-    risk_amount = effective * config.RISK_PER_TRADE_PCT * mult
-    distance = abs(entry_price - stop_loss_price)
-    if distance == 0:
-        return 0.0
-
-    base_qty = (risk_amount / distance) * entry_price  # notional USDT
-
     if signal_strength in ("STRONG_BUY", "STRONG_SELL"):
-        size_factor = 1.0
+        base_signal_factor = 1.0
     elif signal_strength in ("WEAK_BUY", "WEAK_SELL"):
-        size_factor = 0.5
+        base_signal_factor = 0.72
     else:
+        if return_details:
+            return 0.0, {"skip_reason": "NO_ACTIONABLE_SIGNAL"}
         return 0.0
 
-    return base_qty * size_factor * num_multiplier
+    raw_sl_distance = abs(entry_price - stop_loss_price)
+    if entry_price <= 0 or raw_sl_distance <= 0:
+        if return_details:
+            return 0.0, {"skip_reason": "INVALID_ENTRY_OR_STOP"}
+        return 0.0
+
+    # Non-configurable dynamic sizing constants (intentionally hardcoded).
+    BASE_RISK_PCT = 0.0125
+    MIN_RISK_PCT = 0.005
+    MAX_RISK_PCT = 0.020
+    MIN_SL_PCT = 0.0035
+    TARGET_SL_PCT = 0.012
+    MAX_NOTIONAL_CAPITAL_MULT = 3.5
+    MIN_MARGIN_USDT = 8.0
+
+    sl_pct_raw = raw_sl_distance / entry_price
+    sl_pct_used = max(sl_pct_raw, MIN_SL_PCT)
+    used_sl_distance = entry_price * sl_pct_used
+
+    # Wider stops get slightly less risk; tighter stops get slightly more risk.
+    # Keeps risk adaptive while preventing overreaction at extremes.
+    volatility_adjust = (TARGET_SL_PCT / sl_pct_used) ** 0.5
+    volatility_adjust = min(max(volatility_adjust, 0.70), 1.35)
+
+    # Numerology multiplier is damped for sizing so it cannot over-amplify risk.
+    num_for_sizing = min(max(num_multiplier, 0.70), 1.30)
+    numerology_adjust = 0.85 + (num_for_sizing - 0.70) * (0.30 / 0.60)  # maps 0.70..1.30 -> 0.85..1.15
+
+    raw_risk_pct = BASE_RISK_PCT * base_signal_factor * mult * volatility_adjust * numerology_adjust
+    risk_pct = min(max(raw_risk_pct, MIN_RISK_PCT), MAX_RISK_PCT)
+    risk_amount = effective * risk_pct
+
+    base_notional = (risk_amount / used_sl_distance) * entry_price  # USDT notional
+    sized_notional = base_notional
+
+    max_notional = effective * MAX_NOTIONAL_CAPITAL_MULT
+    final_notional = min(sized_notional, max_notional) if max_notional > 0 else sized_notional
+
+    lev = max(1, int(getattr(config, "LEVERAGE", 1)))
+    margin_required = final_notional / lev if final_notional > 0 else 0.0
+
+    details = {
+        "risk_pct_used": risk_pct,
+        "risk_amount_usdt": risk_amount,
+        "base_signal_factor": base_signal_factor,
+        "overlay_multiplier": mult,
+        "sl_pct_raw": sl_pct_raw,
+        "sl_pct_used": sl_pct_used,
+        "min_sl_pct_applied": sl_pct_used > sl_pct_raw,
+        "base_notional_usdt": base_notional,
+        "num_multiplier": num_multiplier,
+        "numerology_adjust": numerology_adjust,
+        "volatility_adjust": volatility_adjust,
+        "max_notional_cap": max_notional,
+        "margin_required_usdt": margin_required,
+        "skip_reason": None,
+    }
+
+    if margin_required < MIN_MARGIN_USDT:
+        details["skip_reason"] = (
+            f"MIN_MARGIN:{margin_required:.2f}<{MIN_MARGIN_USDT:.2f}"
+        )
+        if return_details:
+            return 0.0, details
+        return 0.0
+
+    if return_details:
+        return final_notional, details
+    return final_notional
 
 
 # ── Master Signal Generator ────────────────────────────────────────────────────
@@ -184,6 +248,8 @@ def generate_signal(
     today: Optional[date] = None,
     jd: Optional[float] = None,
     current_ema: float = 0.0,
+    regime_price: float = 0.0,
+    regime_ema: float = 0.0,
     capital: float = 0.0,
 ) -> dict:
     """
@@ -354,6 +420,24 @@ def generate_signal(
             filter_reason = "SHORT_BLOCK:" + ",".join(block_reasons)
             final_action = "NO_TRADE"
 
+    # 7d. Macro regime filter (fixed: BTC EMA282 on 45m)
+    if (
+        filter_reason is None
+        and final_action not in ("HOLD", "NO_TRADE")
+        and regime_price > 0
+        and regime_ema > 0
+    ):
+        if "BUY" in final_action and regime_price < regime_ema:
+            filter_reason = (
+                f"REGIME_BLOCK_LONG:price({regime_price:.2f})<EMA({regime_ema:.2f})"
+            )
+            final_action = "NO_TRADE"
+        elif "SELL" in final_action and regime_price > regime_ema:
+            filter_reason = (
+                f"REGIME_BLOCK_SHORT:price({regime_price:.2f})>EMA({regime_ema:.2f})"
+            )
+            final_action = "NO_TRADE"
+
     if filter_reason:
         logger.info(f"Signal filtered — {filter_reason}")
 
@@ -365,13 +449,14 @@ def generate_signal(
 
     # 10. Position size  (uses live capital if provided, else config fallback)
     effective_capital = capital if capital > 0 else config.CAPITAL_USDT
-    position_size = calculate_position_size(
+    position_size, sizing = calculate_position_size(
         entry_price=current_price,
         stop_loss_price=stop_loss,
         num_multiplier=num_mult,
         signal_strength=final_action,
         capital=effective_capital,
         now=now,
+        return_details=True,
     )
 
     signal = {
@@ -382,6 +467,10 @@ def generate_signal(
         "final_action": final_action,
         "filter_reason": filter_reason,
         "ema_value": round(current_ema, 2) if current_ema else None,
+        "regime_price": round(regime_price, 2) if regime_price else None,
+        "regime_ema": round(regime_ema, 2) if regime_ema else None,
+        "regime_timeframe": "45m",
+        "regime_period": 282,
         "effective_capital": round(effective_capital, 2),
         "size_overlay_enabled": bool(getattr(config, "SIZE_OVERLAY_ENABLED", False)),
         "western_signal": western_signal,
@@ -397,6 +486,13 @@ def generate_signal(
         "stop_loss": round(stop_loss, 2),
         "target": round(target, 2),
         "position_size_usdt": round(position_size, 2),
+        "risk_pct_used": round(sizing.get("risk_pct_used", 0.0), 6),
+        "risk_amount_usdt": round(sizing.get("risk_amount_usdt", 0.0), 4),
+        "margin_required_usdt": round(sizing.get("margin_required_usdt", 0.0), 4),
+        "sizing_skip_reason": sizing.get("skip_reason"),
+        "sl_pct_raw": round(sizing.get("sl_pct_raw", 0.0), 6),
+        "sl_pct_used": round(sizing.get("sl_pct_used", 0.0), 6),
+        "min_sl_pct_applied": bool(sizing.get("min_sl_pct_applied", False)),
         "moon_fast": sky["moon_fast"],
         "nakshatra": sky["nakshatra"],
         "nakshatra_multiplier": nk_mult,

@@ -79,6 +79,9 @@ TAKER_FEE         = 0.0005        # 0.05% per side (Hyperliquid taker)
 SLIPPAGE      = 0.0005        # 0.05% entry slippage (market order spread)
 BLOCKED       = config.TRADE_UNFAVORABLE_NAKSHATRAS
 FUNDING_CSV   = Path("logs/funding_BTCUSDT_2022-01-01_2025-12-31.csv")
+REGIME_SYMBOL = "BTC/USDT"
+REGIME_TIMEFRAME = "45m"
+REGIME_EMA_PERIOD = 282
 
 BTC_MARKET = {
     2022: "Bear  −65%",
@@ -146,6 +149,40 @@ def load_funding_rates() -> pd.Series:
     df = pd.read_csv(FUNDING_CSV)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, format="mixed")
     return df.set_index("timestamp")["funding_rate"]
+
+
+def load_regime_ema_series(start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    """
+    Fetch BTC 45m candles from Binance and build fixed EMA(282) regime series.
+    Returns DataFrame indexed by timestamp with columns: regime_close, regime_ema.
+    """
+    import ccxt
+
+    ex = ccxt.binance({"enableRateLimit": True})
+    since_ms = int(start_ts.timestamp() * 1000)
+    end_ms = int(end_ts.timestamp() * 1000)
+    base_tf = "15m"  # Binance supports 15m; we resample to 45m.
+    step_ms = 15 * 60 * 1000
+    all_rows = []
+
+    while since_ms < end_ms:
+        candles = ex.fetch_ohlcv(REGIME_SYMBOL, base_tf, since=since_ms, limit=1000)
+        if not candles:
+            break
+        all_rows.extend(candles)
+        since_ms = candles[-1][0] + step_ms
+
+    if not all_rows:
+        return pd.DataFrame(columns=["regime_close", "regime_ema"])
+
+    rdf = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    rdf["timestamp"] = pd.to_datetime(rdf["timestamp"], unit="ms", utc=True)
+    rdf = rdf.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").set_index("timestamp")
+    # True 45m close series from 15m candles.
+    r45 = rdf[["close"]].resample("45min").last().dropna()
+    r45["regime_close"] = r45["close"].astype(float)
+    r45["regime_ema"] = r45["regime_close"].ewm(span=REGIME_EMA_PERIOD, adjust=False).mean()
+    return r45[["regime_close", "regime_ema"]]
 
 
 def parse_int_float_map(spec: str) -> dict:
@@ -252,6 +289,10 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
     at     = _atr(prices)
     em     = prices.ewm(span=ema_period, adjust=False).mean()
     rows   = df.copy()   # already at cadence resolution
+    rows["timestamp"] = pd.to_datetime(rows["timestamp"], utc=True)
+
+    # Fixed regime model: BTC EMA(282) on 45m.
+    regime_df = load_regime_ema_series(rows["timestamp"].min(), rows["timestamp"].max())
 
     has_hl = "high" in df.columns and "low" in df.columns
 
@@ -418,6 +459,19 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
             if ema_filter == "two_way" and "BUY" in action and close < float(ev):
                 continue
 
+        # Fixed macro regime filter (matches live model):
+        # trend down => no longs, trend up => no shorts.
+        if not regime_df.empty:
+            r = regime_df[:ts].tail(1)
+            if not r.empty:
+                regime_close = float(r["regime_close"].iloc[0])
+                regime_ema = float(r["regime_ema"].iloc[0])
+                if not np.isnan(regime_close) and not np.isnan(regime_ema):
+                    if "BUY" in action and regime_close < regime_ema:
+                        continue
+                    if "SELL" in action and regime_close > regime_ema:
+                        continue
+
         # ── Size and open trade ────────────────────────────────────────────
         at_v = at.get(i, close * 0.015)
         if pd.isna(at_v) or at_v <= 0:
@@ -439,7 +493,6 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
         if mult <= 0:
             mult = 1.0
 
-        risk = equity * risk_pct * mult
         sld  = at_v * ATR_MULT
 
         # Entry price: next open + slippage
@@ -451,9 +504,38 @@ def simulate(df: pd.DataFrame, funding: pd.Series,
         sl = entry - sld if side == "BUY" else entry + sld
         tp = entry + sld * rr_ratio if side == "BUY" else entry - sld * rr_ratio
 
-        # Notional = risk / stop_distance_pct
-        stop_pct = abs(entry - sl) / entry
-        notional = risk / stop_pct if stop_pct > 0 else risk * 10
+        # Non-configurable dynamic sizing (mirrors live signal_engine logic).
+        BASE_RISK_PCT = 0.0125
+        MIN_RISK_PCT = 0.005
+        MAX_RISK_PCT = 0.020
+        MIN_SL_PCT = 0.0035
+        TARGET_SL_PCT = 0.012
+        MAX_NOTIONAL_CAPITAL_MULT = 3.5
+        MIN_MARGIN_USDT = 8.0
+
+        stop_pct_raw = abs(entry - sl) / entry if entry > 0 else 0.0
+        if stop_pct_raw <= 0:
+            continue
+        stop_pct_used = max(stop_pct_raw, MIN_SL_PCT)
+
+        volatility_adjust = (TARGET_SL_PCT / stop_pct_used) ** 0.5
+        volatility_adjust = min(max(volatility_adjust, 0.70), 1.35)
+
+        # Backtest rows include resonance_day (UDN == life path): map to 1.5x else 1.0x.
+        num_mult = 1.5 if row.get("resonance_day") in (True, "True", 1) else 1.0
+        num_for_sizing = min(max(float(num_mult), 0.70), 1.30)
+        numerology_adjust = 0.85 + (num_for_sizing - 0.70) * (0.30 / 0.60)
+
+        base_signal_factor = 1.0 if action in ("STRONG_BUY", "STRONG_SELL") else 0.72
+        raw_risk_pct = BASE_RISK_PCT * base_signal_factor * mult * volatility_adjust * numerology_adjust
+        risk_pct_eff = min(max(raw_risk_pct, MIN_RISK_PCT), MAX_RISK_PCT)
+        risk = equity * risk_pct_eff
+
+        notional = risk / stop_pct_used
+        notional = min(notional, equity * MAX_NOTIONAL_CAPITAL_MULT)
+        margin_required = notional / max(1, int(getattr(config, "LEVERAGE", 1)))
+        if margin_required < MIN_MARGIN_USDT:
+            continue
 
         fee_cost = notional * TAKER_FEE if use_fees else 0.0
         equity  -= fee_cost   # entry fee deducted immediately
