@@ -13,6 +13,7 @@ Results are saved to logs/backtest_{asset}_{date}.csv (or _15m.csv when --interv
 """
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +37,8 @@ from core.signal_engine import (
 # Suppress info logs during backtest
 logger.remove()
 logger.add(sys.stderr, level="WARNING")
+
+SHORT_CONFIDENCE_THRESHOLD = float(os.getenv("SHORT_CONFIDENCE_THRESHOLD", "0.55"))
 
 
 def fetch_historical_prices(symbol: str, start: datetime, end: datetime, timeframe: str = "1h") -> pd.DataFrame:
@@ -169,7 +172,7 @@ def run_backtest(asset_key: str, start: datetime, end: datetime, interval_hours:
             # Mirror live short-confidence gate to keep backtest/live aligned.
             if "SELL" in (action or ""):
                 sc = short_confidence_score(v_score, hist["vedic"]["medium"], hist["vedic"]["slope"])
-                if sc < 0.55:
+                if sc < SHORT_CONFIDENCE_THRESHOLD:
                     action = "NO_TRADE"
         else:
             action = "COLLECTING_DATA"

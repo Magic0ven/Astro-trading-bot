@@ -8,6 +8,7 @@ Frontend (astro-bot-frontend) expects:
 Run with: uvicorn dashboard_api:app --host 0.0.0.0 --port 8000
 """
 import os
+from datetime import datetime, timezone
 
 # Load .env when running as main (cwd = project root)
 try:
@@ -19,8 +20,9 @@ except Exception:
 if not os.getenv("DATABASE_URL"):
     raise RuntimeError("DATABASE_URL must be set for the dashboard API")
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 import db.postgres as pg
 
@@ -51,6 +53,21 @@ def _bot_users_to_frontend():
     ]
 
 
+def _equity_with_computed_pnl(uid: str) -> dict:
+    """
+    Build equity payload with PnL counters computed from closed trades.
+    This avoids stale/missing KV snapshots causing paper PnL to show 0.
+    """
+    equity = pg.pg_load_equity(user_id=uid) or {}
+    agg = pg.pg_compute_pnl_from_signals(user_id=uid)
+    merged = dict(equity)
+    merged["paper_pnl"] = float(agg.get("paper_pnl", 0.0))
+    merged["paper_trades"] = int(agg.get("paper_trades", 0))
+    merged["paper_wins"] = int(agg.get("paper_wins", 0))
+    merged["paper_losses"] = int(agg.get("paper_losses", 0))
+    return merged
+
+
 # ── /api/* routes (used by frontend proxy) ────────────────────────────────────
 
 @app.get("/api/users")
@@ -75,7 +92,7 @@ def api_get_positions(uid: str):
 @app.get("/api/users/{uid}/equity")
 def api_get_equity(uid: str):
     """Equity state for this bot."""
-    return pg.pg_load_equity(user_id=uid)
+    return _equity_with_computed_pnl(uid)
 
 
 @app.get("/api/users/{uid}/trades")
@@ -89,7 +106,7 @@ def api_get_trades(uid: str, limit: int = Query(200, ge=1, le=500)):
 def api_get_stats(uid: str):
     """Dashboard stats: trades, wins, losses, win_rate, total_pnl, avg_win, avg_loss, etc."""
     s = pg.pg_get_stats(user_id=uid)
-    eq = pg.pg_load_equity(user_id=uid)
+    eq = _equity_with_computed_pnl(uid)
     pos = pg.pg_load_positions(user_id=uid)
     return {
         **s,
@@ -97,6 +114,56 @@ def api_get_stats(uid: str):
         "paper_pnl": eq.get("paper_pnl", 0.0),
         "open_positions": len(pos),
     }
+
+
+class PaperTradeIn(BaseModel):
+    user_id: str
+    side: str
+    entry: float
+    sl: float
+    tp: float
+    notional: float
+    signal: str = "MANUAL"
+
+
+@app.post("/api/paper/trade")
+def api_open_paper_trade(body: PaperTradeIn):
+    side = (body.side or "").upper().strip()
+    if side not in {"BUY", "SELL"}:
+        raise HTTPException(status_code=400, detail="side must be BUY or SELL")
+    if body.entry <= 0 or body.sl <= 0 or body.tp <= 0 or body.notional <= 0:
+        raise HTTPException(status_code=400, detail="entry/sl/tp/notional must be > 0")
+    if side == "BUY" and body.sl >= body.entry:
+        raise HTTPException(status_code=400, detail="SL must be below entry for BUY")
+    if side == "SELL" and body.sl <= body.entry:
+        raise HTTPException(status_code=400, detail="SL must be above entry for SELL")
+
+    positions = pg.pg_load_positions(user_id=body.user_id)
+    new_pos = {
+        "side": side,
+        "signal": body.signal or "MANUAL",
+        "entry": float(body.entry),
+        "sl": float(body.sl),
+        "tp": float(body.tp),
+        "notional": float(body.notional),
+        "risk": abs(body.entry - body.sl) / body.entry * body.notional,
+        "age": 0,
+        "open_ts": datetime.now(timezone.utc).isoformat()[:16],
+        "paper": True,
+    }
+    positions.append(new_pos)
+    pg.pg_save_positions(positions, user_id=body.user_id)
+    return {"status": "ok", "position": new_pos}
+
+
+@app.delete("/api/paper/trade/{uid}/{index}")
+def api_close_paper_trade(uid: str, index: int):
+    positions = pg.pg_load_positions(user_id=uid)
+    if index < 0 or index >= len(positions):
+        raise HTTPException(status_code=400, detail="Invalid position index")
+    removed = positions.pop(index)
+    pg.pg_save_positions(positions, user_id=uid)
+    return {"status": "ok", "removed": removed}
 
 
 @app.get("/api/users/{uid}/latest-signal")
