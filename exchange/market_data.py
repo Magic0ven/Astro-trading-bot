@@ -312,7 +312,9 @@ def get_regime_ema_state() -> tuple[float, float]:
     Returns (benchmark_price, benchmark_ema) for macro regime detection.
     Fixed model: BTC/USDT EMA(282) on 45m (non-configurable).
     """
-    symbol = "BTC/USDT"
+    # Hyperliquid perp symbol format (e.g. BTC/USDC:USDC).
+    # BTC/USDT is not a valid market symbol on Hyperliquid.
+    symbol = "BTC/USDC:USDC"
     tf = "45m"
     period = 282
     needed = max(period + 20, 320)

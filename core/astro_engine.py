@@ -46,7 +46,14 @@ def now_jd() -> float:
 
 def _calc_planet(jd: float, planet_id: int, flags: int) -> dict:
     """Low-level: fetch position and speed for one planet."""
-    result, ret_flag = swe.calc_ut(jd, planet_id, flags)
+    try:
+        result, ret_flag = swe.calc_ut(jd, planet_id, flags)
+    except Exception as e:
+        # Railway/container deployments can have missing/corrupt .se1 files.
+        # Fallback to Moshier ephemeris so signal generation continues.
+        fallback_flags = (flags | swe.FLG_MOSEPH) & ~swe.FLG_SWIEPH
+        logger.warning(f"Swiss ephemeris file unavailable/corrupt, falling back to Moshier: {e}")
+        result, ret_flag = swe.calc_ut(jd, planet_id, fallback_flags)
     longitude = result[0]
     speed = result[3]           # degrees/day; negative = retrograde
     return {
