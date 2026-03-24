@@ -28,6 +28,11 @@ BOT_USER_ID:  str           = os.getenv("BOT_USER_ID", "default")
 
 # ── Connection ─────────────────────────────────────────────────────────────────
 
+def _normalize_uid(uid: Optional[str]) -> str:
+    """Normalize empty/None user ids to default for backward compatibility."""
+    out = (uid or "").strip()
+    return out if out else "default"
+
 def get_conn():
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not set — cannot connect to Postgres")
@@ -175,8 +180,11 @@ def pg_log_close(
 
 def pg_query_signals(limit: int = 200, closed_only: bool = False,
                      user_id: str = None) -> list[dict]:
-    uid   = user_id or BOT_USER_ID
-    where = f"WHERE user_id = %s" + (" AND pnl IS NOT NULL" if closed_only else "")
+    uid = _normalize_uid(user_id or BOT_USER_ID)
+    where = (
+        "WHERE COALESCE(NULLIF(user_id, ''), 'default') = %s"
+        + (" AND pnl IS NOT NULL" if closed_only else "")
+    )
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(f"""
@@ -200,11 +208,11 @@ def pg_query_signals(limit: int = 200, closed_only: bool = False,
 
 def pg_delete_signals_by_action(action: str, user_id: str = None) -> int:
     """Delete all signals with the given action. Returns number of rows deleted."""
-    uid = user_id or BOT_USER_ID
+    uid = _normalize_uid(user_id or BOT_USER_ID)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM signals WHERE user_id = %s AND action = %s",
+                "DELETE FROM signals WHERE COALESCE(NULLIF(user_id, ''), 'default') = %s AND action = %s",
                 (uid, action),
             )
             n = cur.rowcount
@@ -218,7 +226,7 @@ def pg_query_closed_trades_with_side(user_id: str = None) -> list[dict]:
     the preceding open: most recent row with same symbol, pnl IS NULL, action in
     (STRONG_BUY, STRONG_SELL). Side is LONG for STRONG_BUY, SHORT for STRONG_SELL.
     """
-    uid = user_id or BOT_USER_ID
+    uid = _normalize_uid(user_id or BOT_USER_ID)
     with get_conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
@@ -238,7 +246,8 @@ def pg_query_closed_trades_with_side(user_id: str = None) -> list[dict]:
                     ORDER BY o.id DESC
                     LIMIT 1
                 ) o ON true
-                WHERE c.user_id = %s AND c.pnl IS NOT NULL
+                WHERE COALESCE(NULLIF(c.user_id, ''), 'default') = %s
+                  AND c.pnl IS NOT NULL
                 ORDER BY c.id ASC
             """, (uid,))
             rows = [dict(r) for r in cur.fetchall()]
@@ -253,7 +262,7 @@ def pg_compute_pnl_from_signals(user_id: str = None) -> dict:
     Sum PnL from all closed trades (rows with pnl IS NOT NULL).
     Returns dict: paper_pnl, paper_trades, paper_wins, paper_losses.
     """
-    uid = user_id or BOT_USER_ID
+    uid = _normalize_uid(user_id or BOT_USER_ID)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -263,7 +272,8 @@ def pg_compute_pnl_from_signals(user_id: str = None) -> dict:
                     COUNT(*) FILTER (WHERE pnl > 0) AS wins,
                     COUNT(*) FILTER (WHERE pnl <= 0 AND pnl IS NOT NULL) AS losses
                 FROM signals
-                WHERE user_id = %s AND pnl IS NOT NULL
+                WHERE COALESCE(NULLIF(user_id, ''), 'default') = %s
+                  AND pnl IS NOT NULL
             """, (uid,))
             row = cur.fetchone()
     if not row:
@@ -281,7 +291,7 @@ def pg_get_stats(user_id: str = None) -> dict:
     Return dashboard stats for a user: trades, wins, losses, win_rate, total_pnl,
     avg_win, avg_loss. Used by GET /api/users/{uid}/stats.
     """
-    uid = user_id or BOT_USER_ID
+    uid = _normalize_uid(user_id or BOT_USER_ID)
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -293,7 +303,8 @@ def pg_get_stats(user_id: str = None) -> dict:
                     COALESCE(AVG(pnl) FILTER (WHERE pnl > 0), 0) AS avg_win,
                     COALESCE(AVG(pnl) FILTER (WHERE pnl <= 0 AND pnl IS NOT NULL), 0) AS avg_loss
                 FROM signals
-                WHERE user_id = %s AND pnl IS NOT NULL
+                WHERE COALESCE(NULLIF(user_id, ''), 'default') = %s
+                  AND pnl IS NOT NULL
             """, (uid,))
             row = cur.fetchone()
     if not row or row[0] == 0:
@@ -317,7 +328,7 @@ def pg_get_stats(user_id: str = None) -> dict:
 # ── Open positions  (kv key: "{user_id}:open_positions") ─────────────────────
 
 def pg_load_positions(user_id: str = None) -> list:
-    key = f"{user_id or BOT_USER_ID}:open_positions"
+    key = f"{_normalize_uid(user_id or BOT_USER_ID)}:open_positions"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT value FROM kv_store WHERE key = %s", (key,))
@@ -326,7 +337,7 @@ def pg_load_positions(user_id: str = None) -> list:
 
 
 def pg_save_positions(positions: list, user_id: str = None):
-    key = f"{user_id or BOT_USER_ID}:open_positions"
+    key = f"{_normalize_uid(user_id or BOT_USER_ID)}:open_positions"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -349,7 +360,7 @@ _DEFAULT_EQUITY: dict = {
 
 
 def pg_load_equity(user_id: str = None) -> dict:
-    key = f"{user_id or BOT_USER_ID}:equity_state"
+    key = f"{_normalize_uid(user_id or BOT_USER_ID)}:equity_state"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT value FROM kv_store WHERE key = %s", (key,))
@@ -358,7 +369,7 @@ def pg_load_equity(user_id: str = None) -> dict:
 
 
 def pg_save_equity(state: dict, user_id: str = None):
-    key = f"{user_id or BOT_USER_ID}:equity_state"
+    key = f"{_normalize_uid(user_id or BOT_USER_ID)}:equity_state"
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -366,3 +377,32 @@ def pg_save_equity(state: dict, user_id: str = None):
                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
             """, (key, json.dumps(state)))
         conn.commit()
+
+
+def pg_list_bot_users() -> list[dict]:
+    """
+    List discovered bot user_ids from both signals and kv_store.
+    Includes legacy rows where user_id is NULL/empty as 'default'.
+    """
+    users = set()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT COALESCE(NULLIF(user_id, ''), 'default') AS uid
+                FROM signals
+                WHERE COALESCE(NULLIF(user_id, ''), 'default') <> ''
+            """)
+            for (uid,) in cur.fetchall():
+                users.add(_normalize_uid(uid))
+
+            cur.execute("SELECT key FROM kv_store")
+            for (key,) in cur.fetchall():
+                if ":" not in (key or ""):
+                    continue
+                uid = key.split(":", 1)[0]
+                users.add(_normalize_uid(uid))
+
+    if not users:
+        users.add("default")
+
+    return [{"user_id": u} for u in sorted(users)]
