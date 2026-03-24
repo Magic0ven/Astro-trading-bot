@@ -224,7 +224,7 @@ def bot_cycle():
     """Single bot execution cycle. Called by the scheduler each interval."""
     logger.info(f"=== Bot cycle started — {datetime.now(timezone.utc).isoformat()} ===")
 
-    symbol = asset_dna.get("symbol", "BTC/USDT")
+    symbol = asset_dna.get("symbol", "BTC/USDC:USDC")
 
     # Gap 2: force-close any positions that have been open > MAX_OPEN_BARS × interval
     # (mirrors the backtest force-close at 12 bars × 4h = 48h)
@@ -340,7 +340,7 @@ def main():
     # Position monitor: check open positions every N min and book profit if unrealized P&L >= BOOK_PROFIT_AT_R
     if config.POSITION_CHECK_INTERVAL_MINUTES > 0 and config.BOOK_PROFIT_AT_R > 0:
         def position_monitor_cycle():
-            symbol = asset_dna.get("symbol", "BTC/USDT")
+            symbol = asset_dna.get("symbol", "BTC/USDC:USDC")
             price = get_current_price(symbol)
             if price <= 0:
                 return

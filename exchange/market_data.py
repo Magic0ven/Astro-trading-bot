@@ -14,6 +14,8 @@ The live trading engine is Hyperliquid-only.
 import os
 import random
 import time
+import json
+from urllib import request as urlrequest
 import ccxt
 import numpy as np
 import pandas as pd
@@ -115,6 +117,80 @@ def get_exchange() -> ccxt.hyperliquid:
 
 # ── OHLCV ─────────────────────────────────────────────────────────────────────
 
+_INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 3 * 60_000,
+    "5m": 5 * 60_000,
+    "15m": 15 * 60_000,
+    "30m": 30 * 60_000,
+    "1h": 60 * 60_000,
+    "2h": 2 * 60 * 60_000,
+    "4h": 4 * 60 * 60_000,
+    "6h": 6 * 60 * 60_000,
+    "8h": 8 * 60 * 60_000,
+    "12h": 12 * 60 * 60_000,
+    "1d": 24 * 60 * 60_000,
+}
+
+
+def _symbol_to_coin(symbol: str) -> str:
+    # "BTC/USDC:USDC" -> "BTC", "BTC/USDT" -> "BTC"
+    left = (symbol or "").split("/", 1)[0]
+    return left.strip().upper()
+
+
+def _fetch_ohlcv_hyperliquid_info(symbol: str, timeframe: str, limit: int) -> list[list[float]]:
+    """
+    Fetch OHLCV from Hyperliquid /info endpoint using candleSnapshot.
+    Returns ccxt-like rows: [timestamp_ms, open, high, low, close, volume].
+    """
+    interval_ms = _INTERVAL_MS.get(timeframe)
+    if not interval_ms:
+        raise ValueError(f"Unsupported timeframe for candleSnapshot: {timeframe}")
+
+    coin = _symbol_to_coin(symbol)
+    end_ms = int(time.time() * 1000)
+    start_ms = end_ms - (max(1, int(limit)) * interval_ms)
+
+    payload = {
+        "type": "candleSnapshot",
+        "req": {
+            "coin": coin,
+            "interval": timeframe,
+            "startTime": start_ms,
+            "endTime": end_ms,
+        },
+    }
+
+    req = urlrequest.Request(
+        "https://api.hyperliquid.xyz/info",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urlrequest.urlopen(req, timeout=15) as resp:
+        body = resp.read().decode("utf-8")
+    data = json.loads(body)
+    if not isinstance(data, list):
+        raise ValueError(f"Unexpected candleSnapshot response type: {type(data).__name__}")
+
+    rows: list[list[float]] = []
+    for c in data:
+        if not isinstance(c, dict):
+            continue
+        ts = c.get("t")
+        o = c.get("o")
+        h = c.get("h")
+        l = c.get("l")
+        cl = c.get("c")
+        v = c.get("v", 0.0)
+        if ts is None or o is None or h is None or l is None or cl is None:
+            continue
+        rows.append([int(ts), float(o), float(h), float(l), float(cl), float(v)])
+
+    rows.sort(key=lambda x: x[0])
+    return rows[-limit:] if limit > 0 else rows
+
 def fetch_ohlcv(symbol: str, timeframe: str = "4h", limit: int = 100) -> pd.DataFrame:
     """
     Fetch OHLCV candles from Hyperliquid.
@@ -122,26 +198,36 @@ def fetch_ohlcv(symbol: str, timeframe: str = "4h", limit: int = 100) -> pd.Data
     Returns a DataFrame indexed by UTC timestamp with columns:
     open, high, low, close, volume
     """
+    # Primary path: direct Hyperliquid /info candleSnapshot
     try:
-        ex = get_exchange()
-        def _fetch():
-            return ex.fetch_ohlcv(symbol, timeframe, limit=limit)
-
         raw = _with_rate_limit_retries(
             symbol=symbol,
-            op_name="OHLCV",
+            op_name="OHLCV(info)",
             attempts=3,
             base_delay_s=1.0,
             max_delay_s=8.0,
-            fn=_fetch,
+            fn=lambda: _fetch_ohlcv_hyperliquid_info(symbol, timeframe, limit),
         )
-        df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df.set_index("timestamp", inplace=True)
-        return df
     except Exception as e:
-        logger.error(f"OHLCV fetch failed for {symbol} on Hyperliquid: {e}")
-        return pd.DataFrame()
+        logger.warning(f"OHLCV(info) failed for {symbol} ({timeframe}) — falling back to ccxt: {e}")
+        try:
+            ex = get_exchange()
+            raw = _with_rate_limit_retries(
+                symbol=symbol,
+                op_name="OHLCV(ccxt)",
+                attempts=3,
+                base_delay_s=1.0,
+                max_delay_s=8.0,
+                fn=lambda: ex.fetch_ohlcv(symbol, timeframe, limit=limit),
+            )
+        except Exception as e2:
+            logger.error(f"OHLCV fetch failed for {symbol} on Hyperliquid: {e2}")
+            return pd.DataFrame()
+
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.set_index("timestamp", inplace=True)
+    return df
 
 
 def get_current_price(symbol: str) -> float:
@@ -310,13 +396,16 @@ def get_price_atr_ema(symbol: str) -> tuple[float, float, float, float, float]:
 def get_regime_ema_state() -> tuple[float, float]:
     """
     Returns (benchmark_price, benchmark_ema) for macro regime detection.
-    Fixed model: BTC/USDT EMA(282) on 45m (non-configurable).
+    Regime model:
+      - Symbol: BTC/USDC:USDC (Hyperliquid perp format)
+      - EMA: 212 on 1h candles (roughly equivalent horizon to old 282/45m)
     """
     # Hyperliquid perp symbol format (e.g. BTC/USDC:USDC).
     # BTC/USDT is not a valid market symbol on Hyperliquid.
     symbol = "BTC/USDC:USDC"
-    tf = "45m"
-    period = 282
+    # Hyperliquid does not expose 45m OHLCV; use 1h with equivalent horizon.
+    tf = "1h"
+    period = 212
     needed = max(period + 20, 320)
 
     df = fetch_ohlcv(symbol, timeframe=tf, limit=needed)

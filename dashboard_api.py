@@ -39,9 +39,38 @@ app.add_middleware(
 _USER_COLORS = ["#58a6ff", "#3fb950", "#d2a8ff", "#f85149", "#f0883e"]
 
 
+def _configured_user_ids() -> list[str]:
+    """
+    Optional static bot list from env so dropdown can show bots before they
+    write any rows to Postgres.
+    Supported vars:
+      - DASHBOARD_BOT_USERS="default,nakshatraon,bot3"
+      - BOT_USERS="default,nakshatraon,bot3"
+    """
+    raw = os.getenv("DASHBOARD_BOT_USERS") or os.getenv("BOT_USERS") or ""
+    out: list[str] = []
+    for tok in raw.split(","):
+        uid = tok.strip()
+        if uid:
+            out.append(uid)
+    return out
+
+
 def _bot_users_to_frontend():
     """Map pg_list_bot_users() to frontend User[] shape."""
-    bots = pg.pg_list_bot_users()
+    discovered = [b["user_id"] for b in pg.pg_list_bot_users()]
+    configured = _configured_user_ids()
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for uid in configured + discovered:
+        if uid not in seen:
+            merged.append(uid)
+            seen.add(uid)
+    if "default" not in seen:
+        merged.insert(0, "default")
+
+    bots = [{"user_id": uid} for uid in merged]
     return [
         {
             "id": b["user_id"],
