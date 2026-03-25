@@ -180,7 +180,10 @@ ATR_MULTIPLIER        = float(os.getenv("ATR_MULTIPLIER", "1.5"))
 
 # Candle timeframe used for live indicator calculations (ATR + EMA) and for
 # the last-candle high/low used in paper-mode intrabar TP/SL checks.
-ATR_EMA_TIMEFRAME    = os.getenv("ATR_EMA_TIMEFRAME", "4h")
+#
+# If ATR_EMA_FORCE=true, the bot always uses 4h regardless of ATR_EMA_TIMEFRAME.
+ATR_EMA_FORCE = os.getenv("ATR_EMA_FORCE", "false").lower() == "true"
+ATR_EMA_TIMEFRAME = "4h" if ATR_EMA_FORCE else os.getenv("ATR_EMA_TIMEFRAME", "4h")
 
 # ── Position sizing overlays (dayboost + seasonality) ──────────────────────────
 # These scale *risk per trade* (and therefore notional size) without changing the
