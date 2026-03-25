@@ -41,6 +41,7 @@ from exchange.trade_executor import (
     get_paper_summary,
     get_paper_effective_capital,
     get_paper_equity,
+    get_martingale_factor,
     get_open_positions,
     close_paper_positions_at_market,
     has_open_position_opposite_direction,
@@ -263,6 +264,7 @@ def bot_cycle():
 
     # Generate signal (EMA filter + Nakshatra block applied inside)
     regime_price, regime_ema = get_regime_ema_state()
+    martingale_factor = get_martingale_factor() if config.PAPER_TRADING else 1.0
     signal = generate_signal(
         asset_dna=asset_dna,
         score_history=score_history,
@@ -272,6 +274,7 @@ def bot_cycle():
         regime_price=regime_price,
         regime_ema=regime_ema,
         capital=capital,
+        martingale_factor=martingale_factor,
     )
 
     # Paper: on opposite signal, close existing position first then re-size with updated capital
@@ -280,6 +283,7 @@ def bot_cycle():
         if open_positions and has_open_position_opposite_direction(signal, open_positions):
             close_paper_positions_at_market(price)
             capital = get_paper_effective_capital()
+            martingale_factor = get_martingale_factor() if config.PAPER_TRADING else 1.0
             signal = generate_signal(
                 asset_dna=asset_dna,
                 score_history=score_history,
@@ -289,6 +293,7 @@ def bot_cycle():
                 regime_price=regime_price,
                 regime_ema=regime_ema,
                 capital=capital,
+                martingale_factor=martingale_factor,
             )
 
     # Display signal

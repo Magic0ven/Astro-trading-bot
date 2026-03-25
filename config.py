@@ -300,6 +300,16 @@ LEVERAGE = int(os.getenv("LEVERAGE", "3"))          # 1 = no leverage (spot-equi
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 ACTIVE_ASSET = os.getenv("ACTIVE_ASSET", "BTC")
 
+# ── Martingale Sizing (optional) ─────────────────────────────────────────────
+# If enabled, after consecutive losing paper closes the bot increases the
+# next position size by:
+#   MARTINGALE_MULTIPLIER ** martingale_level
+# where martingale_level is incremented on losses and reset to 0 on wins.
+# This is applied only in paper mode (PAPER_TRADING=true).
+MARTINGALE_ENABLED      = os.getenv("MARTINGALE_ENABLED", "false").lower() == "true"
+MARTINGALE_MULTIPLIER  = float(os.getenv("MARTINGALE_MULTIPLIER", "2.0"))
+MARTINGALE_MAX_STEPS   = int(os.getenv("MARTINGALE_MAX_STEPS", "5"))
+
 # ── Pythagorean Chart ─────────────────────────────────────────────────────────
 PYTHAGOREAN_MAP = {
     'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5, 'f': 6, 'g': 7, 'h': 8, 'i': 9,

@@ -144,6 +144,7 @@ def calculate_position_size(
     signal_strength: str,
     capital: float = 0.0,
     now: Optional[datetime] = None,
+    martingale_factor: float = 1.0,
     return_details: bool = False,
 ) -> float | tuple[float, dict]:
     """
@@ -218,7 +219,8 @@ def calculate_position_size(
 
     raw_risk_pct = BASE_RISK_PCT * base_signal_factor * mult * volatility_adjust * numerology_adjust
     risk_pct = min(max(raw_risk_pct, MIN_RISK_PCT), MAX_RISK_PCT)
-    risk_amount = effective * risk_pct
+    martingale_factor = max(0.0, float(martingale_factor or 0.0))
+    risk_amount = effective * risk_pct * martingale_factor
 
     base_notional = (risk_amount / used_sl_distance) * entry_price  # USDT notional
     sized_notional = base_notional
@@ -230,8 +232,10 @@ def calculate_position_size(
     margin_required = final_notional / lev if final_notional > 0 else 0.0
 
     details = {
-        "risk_pct_used": risk_pct,
+        # Effective risk percent after martingale multiplier.
+        "risk_pct_used": risk_pct * martingale_factor,
         "risk_amount_usdt": risk_amount,
+        "martingale_factor": martingale_factor,
         "base_signal_factor": base_signal_factor,
         "overlay_multiplier": mult,
         "sl_pct_raw": sl_pct_raw,
@@ -272,6 +276,7 @@ def generate_signal(
     regime_price: float = 0.0,
     regime_ema: float = 0.0,
     capital: float = 0.0,
+    martingale_factor: float = 1.0,
 ) -> dict:
     """
     Full signal generation pipeline for one bot cycle.
@@ -486,6 +491,7 @@ def generate_signal(
         signal_strength=final_action,
         capital=effective_capital,
         now=now,
+        martingale_factor=martingale_factor,
         return_details=True,
     )
 

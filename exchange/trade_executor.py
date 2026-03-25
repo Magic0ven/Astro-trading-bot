@@ -332,6 +332,10 @@ def check_and_close_stale_positions():
     if not positions:
         return
 
+    martingale_state = None
+    if getattr(config, "PAPER_TRADING", True) and getattr(config, "MARTINGALE_ENABLED", False):
+        martingale_state = _load_equity_state()
+
     max_hold_minutes = config.MAX_OPEN_BARS * config.CHECK_INTERVAL_MINUTES
     now = datetime.now(timezone.utc)
     still_open = []
@@ -352,6 +356,9 @@ def check_and_close_stale_positions():
                 f"open for {age_hours:.1f}h (max {max_hold_minutes/60:.0f}h) — force-closing."
             )
             if pos.get("paper", True):
+                if martingale_state is not None:
+                    # Timeout outcome is treated as a loss for martingale sizing.
+                    _apply_martingale_to_state(martingale_state, pnl=None, result="TIMEOUT")
                 log_signal_to_db(
                     {
                         "timestamp":        now.isoformat(),
@@ -373,6 +380,8 @@ def check_and_close_stale_positions():
             still_open.append(pos)
 
     _save_open_positions(still_open)
+    if martingale_state is not None:
+        _save_equity_state(martingale_state)
 
 
 # ── Gap 3: Drawdown halt tracker ──────────────────────────────────────────────
@@ -391,6 +400,9 @@ def _load_equity_state() -> dict:
         "paper_losses":          0,
         "paper_timeouts":        0,
         "paper_starting_equity": config.CAPITAL_USDT,
+        # Martingale state (optional)
+        "martingale_level":     0,
+        "martingale_last_outcome": "",
     }
 
 
@@ -401,6 +413,66 @@ def _save_equity_state(state: dict):
     _LOGS_DIR.mkdir(parents=True, exist_ok=True)
     with open(EQUITY_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+
+def get_martingale_factor() -> float:
+    """
+    Martingale position-sizing multiplier for the next generated signal.
+
+    Only applied in paper mode. Increments after a losing paper close and
+    resets to 1.0 after a winning paper close.
+    """
+    if not getattr(config, "MARTINGALE_ENABLED", False):
+        return 1.0
+    if not getattr(config, "PAPER_TRADING", True):
+        return 1.0
+
+    state = _load_equity_state()
+    level = int(state.get("martingale_level", 0) or 0)
+    mult = float(getattr(config, "MARTINGALE_MULTIPLIER", 2.0))
+    # level=0 => 1.0, level=1 => mult, etc.
+    return float(mult ** max(level, 0))
+
+
+def _apply_martingale_to_state(state: dict, *, pnl: float | None, result: str):
+    """
+    Update martingale_level inside the provided equity_state dict.
+
+    - LOSS: increment level (capped by MARTINGALE_MAX_STEPS)
+    - WIN: reset level to 0
+    """
+    if not getattr(config, "MARTINGALE_ENABLED", False):
+        return
+    if not getattr(config, "PAPER_TRADING", True):
+        return
+
+    max_steps = int(getattr(config, "MARTINGALE_MAX_STEPS", 5))
+    level = int(state.get("martingale_level", 0) or 0)
+
+    result_up = (result or "").upper()
+
+    if pnl is not None:
+        is_win = pnl > 0
+        is_loss = pnl < 0 or pnl == 0 and result_up in {"SL", "TIMEOUT"}
+    else:
+        # If we don't know PnL, classify based on close reason.
+        is_win = result_up in {"TP", "BOOK_PROFIT"}
+        is_loss = result_up in {"SL", "TIMEOUT", "OPPOSITE_SIGNAL"}
+
+    prev = level
+    if is_win:
+        level = 0
+    elif is_loss:
+        level = min(prev + 1, max_steps)
+    # else: keep unchanged
+
+    if level != prev:
+        logger.info(
+            f"MARTINGALE: {('WIN' if level == 0 else 'LOSS')}: "
+            f"{prev} -> {level} (result={result_up}, pnl={pnl})"
+        )
+        state["martingale_last_outcome"] = f"{result_up}:{'WIN' if level == 0 else 'LOSS'}"
+        state["martingale_level"] = level
 
 
 def get_paper_summary() -> dict:
@@ -494,6 +566,9 @@ def close_paper_positions_at_market(close_price: float) -> list:
             state["paper_wins"] = state.get("paper_wins", 0) + 1
         else:
             state["paper_losses"] = state.get("paper_losses", 0) + 1
+
+        # Update martingale sizing for the NEXT signal.
+        _apply_martingale_to_state(state, pnl=pnl, result="OPPOSITE_SIGNAL")
 
         entry = pos.get("entry_price", 0.0)
         action = pos.get("action", "")
@@ -645,6 +720,9 @@ def check_paper_positions(
             else:
                 state["paper_losses"] = state.get("paper_losses", 0) + 1
 
+            # Update martingale sizing for the NEXT signal.
+            _apply_martingale_to_state(state, pnl=pnl, result=result)
+
             # Persist close record to DB
             _ts  = datetime.now(timezone.utc).isoformat()
             _sym = pos.get("symbol", "")
@@ -756,6 +834,9 @@ def check_and_book_profit(current_price: float) -> list[dict]:
                 state["paper_wins"]   = state.get("paper_wins", 0) + 1
             else:
                 state["paper_losses"] = state.get("paper_losses", 0) + 1
+
+            # Update martingale sizing for the NEXT signal.
+            _apply_martingale_to_state(state, pnl=pnl, result=result)
 
             if pos.get("paper", True):
                 _ts  = now.isoformat()
