@@ -1094,7 +1094,15 @@ def dispatch_signal(signal: dict, current_equity: float = 0.0):
         log_signal_to_db(signal, paper=True, notes="Skipped — drawdown halt active")
         return
 
-    # One position at a time: same direction → skip; opposite → close then open
+    # Determine if this signal is actually tradeable (non-zero size, no sizing skip).
+    tradable = (
+        action in ("STRONG_BUY", "STRONG_SELL")
+        and (signal.get("position_size_usdt") or 0) > 0
+        and not signal.get("sizing_skip_reason")
+    )
+
+    # One position at a time: same direction → skip; opposite → close then open.
+    # IMPORTANT: we only close on an opposite signal if the new signal is tradeable.
     positions = _load_open_positions()
     if positions:
         if has_open_position_same_direction(signal, positions):
@@ -1105,6 +1113,16 @@ def dispatch_signal(signal: dict, current_equity: float = 0.0):
             log_signal_to_db(signal, paper=True, notes="Skipped — already have open position (same direction)")
             return
         if has_open_position_opposite_direction(signal, positions):
+            # If the new signal is not tradeable (size=0, sizing skip, or non-STRONG),
+            # do NOT close the existing position. Just log the signal as skipped.
+            if not tradable:
+                log_signal_to_db(
+                    signal,
+                    paper=True,
+                    notes="Skipped — opposite signal not tradeable (size=0 / sizing_skip_reason / non-STRONG)",
+                )
+                return
+
             # Close existing position(s) first, then open new (close-then-open, not both)
             paper_positions = [p for p in positions if p.get("paper", True)]
             live_positions = [p for p in positions if not p.get("paper", True)]
