@@ -137,10 +137,16 @@ def api_get_stats(uid: str):
     s = pg.pg_get_stats(user_id=uid)
     eq = _equity_with_computed_pnl(uid)
     pos = pg.pg_load_positions(user_id=uid)
+    raw_start = eq.get("paper_starting_equity")
+    try:
+        paper_starting_equity = float(raw_start) if raw_start is not None else 0.0
+    except (TypeError, ValueError):
+        paper_starting_equity = 0.0
     return {
         **s,
         "peak_equity": eq.get("peak_equity", 0.0),
         "paper_pnl": eq.get("paper_pnl", 0.0),
+        "paper_starting_equity": paper_starting_equity,
         "open_positions": len(pos),
     }
 
