@@ -311,13 +311,23 @@ def get_account_balance() -> float:
         ex = get_exchange()
         balance = ex.fetch_balance()
 
-        equity = (
-            balance.get("total", {}).get("USDC")
-            or balance.get("total", {}).get("USDT")
-            or balance.get("info", {}).get("marginSummary", {}).get("accountValue")
-        )
+        # Do not use `x or y` here: USDC/USDT can be 0.0 (falsy) on an unfunded
+        # wallet; that must not skip to marginSummary (often absent in ccxt shape).
+        total = balance.get("total") or {}
+        info = balance.get("info") or {}
+        margin_summary = info.get("marginSummary") or {}
+        if isinstance(margin_summary, dict):
+            account_value = margin_summary.get("accountValue")
+        else:
+            account_value = None
 
-        if equity is None:
+        if total.get("USDC") is not None:
+            equity = total["USDC"]
+        elif total.get("USDT") is not None:
+            equity = total["USDT"]
+        elif account_value is not None:
+            equity = account_value
+        else:
             raise ValueError(f"Unexpected balance structure: {balance}")
 
         val = float(equity)
