@@ -108,7 +108,9 @@ def _full_signal_payload(signal: dict) -> str:
 # ── SQLite trade log ───────────────────────────────────────────────────────────
 
 def _init_db():
-    conn = sqlite3.connect(config.DB_PATH)
+    db_path = Path(config.DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
     conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
